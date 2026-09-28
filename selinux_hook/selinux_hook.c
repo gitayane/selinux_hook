@@ -2920,6 +2920,47 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     WRITE_ONCE(avd->flags, (u32)a->local.data3);
 }
 
+static void before_context_struct_compute_av_legacy4(hook_fargs4_t *a, void *u)
+{
+    struct policydb *clean_pdb;
+    struct context *scontext;
+    struct context *tcontext;
+    u16 tclass;
+    struct av_decision *avd;
+    struct av_decision clean_avd;
+
+    if (READ_ONCE(g_internal_policy_load_depth) || current_is_policy_manager())
+        return;
+
+    clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
+    if (clean_pdb && !READ_ONCE(g_clean_policydb_av_disabled)) {
+        scontext = (struct context *)a->arg0;
+        tcontext = (struct context *)a->arg1;
+        tclass = (u16)a->arg2;
+        avd = (struct av_decision *)a->arg3;
+
+        if (context_struct_compute_av_intel(clean_pdb, scontext, tcontext,
+                                            tclass, &clean_avd, NULL)) {
+            clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
+            clean_avd.flags = avd->flags;
+            *avd = clean_avd;
+            a->skip_origin = 1;
+            return;
+        }
+
+        WRITE_ONCE(g_clean_policydb_av_disabled, true);
+        pr_warn("[selinux_hook] legacy4 clean policydb AV disabled kver=%x policydb=%px tclass=%hu; falling back to live compute\n",
+                kver, clean_pdb, tclass);
+    }
+
+    if (!READ_ONCE(g_selinux_ready)) {
+        WRITE_ONCE(g_selinux_ready, true);
+        selinux_hook_dbg("[selinux_hook] SELinux ready inferred from legacy4 context_struct_compute_av\n");
+    }
+
+    snapshot_clean_policy("legacy4_compute_av");
+}
+
 static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 {
     struct policydb *clean_pdb;
@@ -4397,6 +4438,10 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
+        } else if (kver < VERSION(4, 14, 0)) {
+            g_funcs[g_hooks++] = (void *)addr;
+            pr_info("[selinux_hook] hook legacy4 context_struct_compute_av argc=4 kver=%x\n", kver);
+            hook_wrap((void *)addr, 4, before_context_struct_compute_av_legacy4, NULL, NULL);
         } else if (clean_policydb_redirect_supported()) {
             g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
