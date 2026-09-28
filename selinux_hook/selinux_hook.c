@@ -344,9 +344,10 @@ struct avtab {
 #define OCON_NODE 4
 #define OCON_FSUSE 5
 #define OCON_NODE6 6
-#define OCON_IBPKEY 7
-#define OCON_IBENDPORT 8
-#define OCON_NUM 9
+/* Sony Maple 4.4.302 follows the 4.4 policydb layout: 7 ocontext slots.
+ * Do not include newer IBPKEY/IBENDPORT slots here, or every field after
+ * ocontexts[] is shifted by 16 bytes. */
+#define OCON_NUM 7
 
 struct policydb {
     int mls_enabled;
@@ -1528,15 +1529,22 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
         }
     }
 
-    constraint = tclass_datum->constraints;
-    while (constraint) {
-        if ((constraint->permissions & avd->allowed) &&
-            constraint_expr_eval_fn &&
-            !constraint_expr_eval_fn(policydb, scontext, tcontext, NULL,
-                                     constraint->expr)) {
-            avd->allowed &= ~constraint->permissions;
+    /*
+     * 4.4.302 constraint_expr_eval() takes
+     * (scontext, tcontext, xcontext, expr) and reads the global policydb.
+     * It cannot be applied to this standalone clean policydb copy.
+     */
+    if (kver >= VERSION(4, 15, 0)) {
+        constraint = tclass_datum->constraints;
+        while (constraint) {
+            if ((constraint->permissions & avd->allowed) &&
+                constraint_expr_eval_fn &&
+                !constraint_expr_eval_fn(policydb, scontext, tcontext, NULL,
+                                         constraint->expr)) {
+                avd->allowed &= ~constraint->permissions;
+            }
+            constraint = constraint->next;
         }
-        constraint = constraint->next;
     }
 
     if (tclass == policydb->process_class &&
@@ -1551,7 +1559,12 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
             avd->allowed &= ~policydb->process_trans_perms;
     }
 
-    if (type_attribute_bounds_av_fn)
+    /*
+     * 4.4.302 type_attribute_bounds_av() also uses the global policydb and
+     * recursively invokes the 5-argument-free context_struct_compute_av().
+     * Do not call it from a standalone clean-policy computation.
+     */
+    if (kver >= VERSION(4, 15, 0) && type_attribute_bounds_av_fn)
         type_attribute_bounds_av_fn(policydb, scontext, tcontext, tclass, avd);
 
     return true;
