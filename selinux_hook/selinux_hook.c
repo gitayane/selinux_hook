@@ -4452,9 +4452,18 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
         } else if (kver < VERSION(4, 14, 0)) {
-            g_funcs[g_hooks++] = (void *)addr;
-            pr_info("[selinux_hook] hook legacy4 context_struct_compute_av argc=4 kver=%x\n", kver);
-            hook_wrap((void *)addr, 4, before_context_struct_compute_av_legacy4, NULL, NULL);
+            /*
+             * Do not hook context_struct_compute_av on pre-4.14 kernels.
+             * On Sony Maple 4.4.302, replacing the normal AV calculation with
+             * the reconstructed clean policy causes ordinary system/app
+             * permission checks to be evaluated against that auxiliary policy,
+             * producing widespread service_manager/binder denials.
+             *
+             * 4.4 still keeps the dedicated selinuxfs/procattr filtering paths
+             * above; only the global AV hook is disabled here.
+             */
+            pr_info("[selinux_hook] skip context_struct_compute_av on pre-4.14 kernel kver=%x\n",
+                    kver);
         } else if (clean_policydb_redirect_supported()) {
             g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
