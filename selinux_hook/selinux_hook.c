@@ -916,10 +916,17 @@ static bool policydb_offset_fallback_allowed(void)
 static bool write_op_slot_fallback_allowed(void)
 {
     /*
-     * Keep the c02-compatible 4.14 behavior from the last commit: do not patch
-     * write_op[] on 4.14-or-older kernels.  For newer kernels, preserve the
-     * pre-merge fallback when sel_write_access() is not directly resolvable.
+     * Sony Maple 4.4.x keeps the classic selinuxfs write_op[] transaction
+     * table: SEL_CONTEXT == 5 and SEL_ACCESS == 6. The direct sel_write_*
+     * symbols may be absent from the exported/kallsyms view, so the 4.4 path
+     * needs the write_op[] fallback in order to filter DirtySepolicy's
+     * /sys/fs/selinux/context and /sys/fs/selinux/access probes.
+     *
+     * Keep the existing 4.14 compatibility restriction, but explicitly allow
+     * the pre-4.9 legacy layout used by Sony Maple 4.4.302.
      */
+    if (kver < VERSION(4, 9, 0))
+        return true;
     return !selinux_414_compat_path();
 }
 
