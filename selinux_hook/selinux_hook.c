@@ -498,7 +498,290 @@ static bool legacy_should_block_access_query(const char *query, size_t len);
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
 static int clean_context_to_struct(const char *query, size_t len,
                                    struct context *ctx);
+static bool clean_ebitmap_contains(const struct ebitmap *a,
+                                  const struct ebitmap *b)
+{
+    struct ebitmap_node *node;
+    unsigned int bit;
+
+    if (!a || !b || a->highbit < b->highbit)
+        return false;
+
+    ebitmap_for_each_positive_bit_intel((struct ebitmap *)b, node, bit) {
+        if (!clean_ebitmap_test(a, bit))
+            return false;
+    }
+    return true;
+}
+
+static bool clean_ebitmap_equal(const struct ebitmap *a,
+                                const struct ebitmap *b)
+{
+    if (!a || !b || a->highbit != b->highbit)
+        return false;
+
+    return clean_ebitmap_contains(a, b) &&
+           clean_ebitmap_contains(b, a);
+}
+
+static bool clean_mls_level_eq(const struct mls_level *a,
+                               const struct mls_level *b)
+{
+    return a && b && a->sens == b->sens &&
+           clean_ebitmap_equal(&a->cat, &b->cat);
+}
+
+static bool clean_mls_level_dom(const struct mls_level *a,
+                                const struct mls_level *b)
+{
+    return a && b && a->sens >= b->sens &&
+           clean_ebitmap_contains(&a->cat, &b->cat);
+}
+
+static bool clean_constraint_expr_eval(struct policydb *policydb,
+                                       struct context *scontext,
+                                       struct context *tcontext,
+                                       struct context *xcontext,
+                                       struct constraint_expr *cexpr)
+{
+    u32 val1, val2;
+    struct context *c;
+    struct role_datum *r1;
+    struct role_datum *r2;
+    struct mls_level *l1;
+    struct mls_level *l2;
+    struct constraint_expr *e;
+    int stack[CEXPR_MAXDEPTH];
+    int sp = -1;
+
+    if (!policydb || !scontext || !tcontext || !cexpr)
+        return false;
+
+    for (e = cexpr; e; e = e->next) {
+        switch (e->expr_type) {
+        case CEXPR_NOT:
+            if (sp < 0)
+                return false;
+            stack[sp] = !stack[sp];
+            break;
+        case CEXPR_AND:
+            if (sp < 1)
+                return false;
+            sp--;
+            stack[sp] &= stack[sp + 1];
+            break;
+        case CEXPR_OR:
+            if (sp < 1)
+                return false;
+            sp--;
+            stack[sp] |= stack[sp + 1];
+            break;
+        case CEXPR_ATTR:
+            if (sp == CEXPR_MAXDEPTH - 1)
+                return false;
+
+            switch (e->attr) {
+            case CEXPR_USER:
+                val1 = scontext->user;
+                val2 = tcontext->user;
+                break;
+            case CEXPR_TYPE:
+                val1 = scontext->type;
+                val2 = tcontext->type;
+                break;
+            case CEXPR_ROLE:
+                val1 = scontext->role;
+                val2 = tcontext->role;
+                if (!policydb->role_val_to_struct ||
+                    !val1 || !val2 ||
+                    val1 > policydb->p_roles.nprim ||
+                    val2 > policydb->p_roles.nprim)
+                    return false;
+                r1 = policydb->role_val_to_struct[val1 - 1];
+                r2 = policydb->role_val_to_struct[val2 - 1];
+                if (!r1 || !r2)
+                    return false;
+
+                if (e->op == CEXPR_DOM) {
+                    stack[++sp] = clean_ebitmap_test(&r1->dominates, val2 - 1);
+                    continue;
+                }
+                if (e->op == CEXPR_DOMBY) {
+                    stack[++sp] = clean_ebitmap_test(&r2->dominates, val1 - 1);
+                    continue;
+                }
+                if (e->op == CEXPR_INCOMP) {
+                    stack[++sp] =
+                        !clean_ebitmap_test(&r1->dominates, val2 - 1) &&
+                        !clean_ebitmap_test(&r2->dominates, val1 - 1);
+                    continue;
+                }
+                break;
+            case CEXPR_L1L2:
+                l1 = &scontext->range.level[0];
+                l2 = &tcontext->range.level[0];
+                goto mls_ops;
+            case CEXPR_L1H2:
+                l1 = &scontext->range.level[0];
+                l2 = &tcontext->range.level[1];
+                goto mls_ops;
+            case CEXPR_H1L2:
+                l1 = &scontext->range.level[1];
+                l2 = &tcontext->range.level[0];
+                goto mls_ops;
+            case CEXPR_H1H2:
+                l1 = &scontext->range.level[1];
+                l2 = &tcontext->range.level[1];
+                goto mls_ops;
+            case CEXPR_L1H1:
+                l1 = &scontext->range.level[0];
+                l2 = &scontext->range.level[1];
+                goto mls_ops;
+            case CEXPR_L2H2:
+                l1 = &tcontext->range.level[0];
+                l2 = &tcontext->range.level[1];
+                goto mls_ops;
+            default:
+                return false;
+            }
+
+mls_ops:
+            switch (e->op) {
+            case CEXPR_EQ:
+                stack[++sp] = clean_mls_level_eq(l1, l2);
+                break;
+            case CEXPR_NEQ:
+                stack[++sp] = !clean_mls_level_eq(l1, l2);
+                break;
+            case CEXPR_DOM:
+                stack[++sp] = clean_mls_level_dom(l1, l2);
+                break;
+            case CEXPR_DOMBY:
+                stack[++sp] = clean_mls_level_dom(l2, l1);
+                break;
+            case CEXPR_INCOMP:
+                stack[++sp] = !clean_mls_level_dom(l1, l2) &&
+                              !clean_mls_level_dom(l2, l1);
+                break;
+            default:
+                return false;
+            }
+            break;
+        case CEXPR_NAMES:
+            if (sp == CEXPR_MAXDEPTH - 1)
+                return false;
+            c = scontext;
+            if (e->attr & CEXPR_TARGET)
+                c = tcontext;
+            else if (e->attr & CEXPR_XTARGET)
+                c = xcontext;
+            if (!c)
+                return false;
+
+            if (e->attr & CEXPR_USER)
+                val1 = c->user;
+            else if (e->attr & CEXPR_ROLE)
+                val1 = c->role;
+            else if (e->attr & CEXPR_TYPE)
+                val1 = c->type;
+            else
+                return false;
+
+            if (e->op == CEXPR_EQ)
+                stack[++sp] = clean_ebitmap_test(&e->names, val1 - 1);
+            else if (e->op == CEXPR_NEQ)
+                stack[++sp] = !clean_ebitmap_test(&e->names, val1 - 1);
+            else
+                return false;
+            break;
+        default:
+            return false;
+        }
+    }
+
+    return sp == 0 ? !!stack[0] : false;
+}
+
+static bool clean_type_attribute_bounds_av(struct policydb *policydb,
+                                           struct context *scontext,
+                                           struct context *tcontext,
+                                           u16 tclass,
+                                           struct av_decision *avd,
+                                           unsigned int depth)
+{
+    struct type_datum *source;
+    struct type_datum *target;
+    struct av_decision lower;
+    bool any = false;
+
+    if (!policydb || !scontext || !tcontext || !avd ||
+        !policydb->type_val_to_struct_array ||
+        !flex_array_get_fn)
+        return false;
+
+    if (depth > POLICYDB_BOUNDS_MAXDEPTH)
+        return false;
+
+    source = (struct type_datum *)flex_array_get_fn(
+        policydb->type_val_to_struct_array, scontext->type - 1);
+    target = (struct type_datum *)flex_array_get_fn(
+        policydb->type_val_to_struct_array, tcontext->type - 1);
+    if (!source || !target)
+        return false;
+
+    if (source->bounds) {
+        struct context lower_s = *scontext;
+        lower_s.type = source->bounds;
+        zero_bytes(&lower, sizeof(lower));
+        if (!context_struct_compute_av_intel(policydb, &lower_s, tcontext,
+                                             tclass, &lower, NULL))
+            return false;
+        if ((lower.allowed & avd->allowed) != avd->allowed)
+            any = true;
+        avd->allowed &= lower.allowed;
+    }
+
+    if (target->bounds) {
+        struct context lower_t = *tcontext;
+        lower_t.type = target->bounds;
+        zero_bytes(&lower, sizeof(lower));
+        if (!context_struct_compute_av_intel(policydb, scontext, &lower_t,
+                                             tclass, &lower, NULL))
+            return false;
+        if ((lower.allowed & avd->allowed) != avd->allowed)
+            any = true;
+        avd->allowed &= lower.allowed;
+    }
+
+    if (source->bounds && target->bounds) {
+        struct context lower_s = *scontext;
+        struct context lower_t = *tcontext;
+        lower_s.type = source->bounds;
+        lower_t.type = target->bounds;
+        zero_bytes(&lower, sizeof(lower));
+        if (!context_struct_compute_av_intel(policydb, &lower_s, &lower_t,
+                                             tclass, &lower, NULL))
+            return false;
+        if ((lower.allowed & avd->allowed) != avd->allowed)
+            any = true;
+        avd->allowed &= lower.allowed;
+    }
+
+    return true || any;
+}
+
 static int clean_access_transaction(char *buf, size_t size);
+static bool clean_constraint_expr_eval(struct policydb *policydb,
+                                       struct context *scontext,
+                                       struct context *tcontext,
+                                       struct context *xcontext,
+                                       struct constraint_expr *cexpr);
+static bool clean_type_attribute_bounds_av(struct policydb *policydb,
+                                          struct context *scontext,
+                                          struct context *tcontext,
+                                          u16 tclass,
+                                          struct av_decision *avd,
+                                          unsigned int depth);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
@@ -1504,7 +1787,13 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
         xperms->len = 0;
     }
 
-    if (unlikely(!tclass || tclass > policydb->symtab[SYM_CLASSES].nprim)) {
+    if (unlikely(!tclass)) {
+        avd->allowed = policydb->allow_unknown ? 0xffffffffU : 0;
+        avd->seqno = SELINUX_STATUS_CLEAN_POLICYLOAD;
+        return true;
+    }
+
+    if (unlikely(tclass > policydb->symtab[SYM_CLASSES].nprim)) {
         pr_warn("[selinux_hook] intel_av invalid class %hu\n", tclass);
         return false;
     }
@@ -1563,19 +1852,16 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
     }
 
     /*
-     * 4.4.302 constraint_expr_eval() takes
-     * (scontext, tcontext, xcontext, expr) and reads the global policydb.
-     * It cannot be applied to this standalone clean policydb copy.
+     * Evaluate constraints against the captured policydb, not the live global
+     * policydb used by the original 4.4 helper.
      */
-    if (kver >= VERSION(4, 15, 0)) {
-        constraint = tclass_datum->constraints;
+    {
+        struct constraint_node *constraint = tclass_datum->constraints;
         while (constraint) {
             if ((constraint->permissions & avd->allowed) &&
-                constraint_expr_eval_fn &&
-                !constraint_expr_eval_fn(policydb, scontext, tcontext, NULL,
-                                         constraint->expr)) {
+                !clean_constraint_expr_eval(policydb, scontext, tcontext,
+                                             NULL, constraint->expr))
                 avd->allowed &= ~constraint->permissions;
-            }
             constraint = constraint->next;
         }
     }
@@ -1593,12 +1879,11 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
     }
 
     /*
-     * 4.4.302 type_attribute_bounds_av() also uses the global policydb and
-     * recursively invokes the 5-argument-free context_struct_compute_av().
-     * Do not call it from a standalone clean-policy computation.
+     * Apply type-bound masking recursively against the same clean policydb.
      */
-    if (kver >= VERSION(4, 15, 0) && type_attribute_bounds_av_fn)
-        type_attribute_bounds_av_fn(policydb, scontext, tcontext, tclass, avd);
+    if (!clean_type_attribute_bounds_av(policydb, scontext, tcontext,
+                                        tclass, avd, 0))
+        return false;
 
     return true;
 }
@@ -3029,6 +3314,8 @@ static int clean_access_transaction(char *buf, size_t size)
     struct av_decision avd;
     struct extended_perms xperms;
     struct policydb *policydb;
+    bool have_sctx = false;
+    bool have_tctx = false;
     int rc;
 
     if (!buf || !size || !READ_ONCE(g_clean_policy_blob) ||
@@ -3102,16 +3389,22 @@ static int clean_access_transaction(char *buf, size_t size)
         vfree_fn(tmp);
         return -EINVAL;
     }
+    have_sctx = true;
 
     rc = clean_context_to_struct(dst, token_len(dst), &tctx);
     if (rc == -EAGAIN) {
+        ebitmap_destroy_fn(&sctx.range.level[0].cat);
+        ebitmap_destroy_fn(&sctx.range.level[1].cat);
         vfree_fn(tmp);
         return 0;
     }
     if (rc) {
+        ebitmap_destroy_fn(&sctx.range.level[0].cat);
+        ebitmap_destroy_fn(&sctx.range.level[1].cat);
         vfree_fn(tmp);
         return -EINVAL;
     }
+    have_tctx = true;
 
     zero_bytes(&avd, sizeof(avd));
     zero_bytes(&xperms, sizeof(xperms));
@@ -3119,8 +3412,7 @@ static int clean_access_transaction(char *buf, size_t size)
     rc = context_struct_compute_av_intel(policydb, &sctx, &tctx,
                                          (u16)class_value, &avd, &xperms);
     if (!rc) {
-        vfree_fn(tmp);
-        return 0;
+        goto out_cleanup;
     }
 
     avd.seqno = SELINUX_STATUS_CLEAN_POLICYLOAD;
@@ -3133,8 +3425,20 @@ static int clean_access_transaction(char *buf, size_t size)
                    avd.auditallow, avd.auditdeny,
                    avd.seqno, avd.flags);
 
+    if (rc <= 0 || (size_t)rc >= size)
+        rc = 0;
+
+out_cleanup:
+    if (have_tctx) {
+        ebitmap_destroy_fn(&tctx.range.level[0].cat);
+        ebitmap_destroy_fn(&tctx.range.level[1].cat);
+    }
+    if (have_sctx) {
+        ebitmap_destroy_fn(&sctx.range.level[0].cat);
+        ebitmap_destroy_fn(&sctx.range.level[1].cat);
+    }
     vfree_fn(tmp);
-    return (rc > 0 && (size_t)rc < size) ? rc : 0;
+    return rc > 0 ? rc : 0;
 }
 
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
@@ -3168,6 +3472,8 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
     }
 
     *out_sid = parsed.type;
+    ebitmap_destroy_fn(&parsed.range.level[0].cat);
+    ebitmap_destroy_fn(&parsed.range.level[1].cat);
     return 0;
 }
 
