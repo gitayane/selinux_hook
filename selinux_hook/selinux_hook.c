@@ -139,6 +139,31 @@ struct context {
     u32 hash;
 };
 
+#ifndef CEXPR_MAXDEPTH
+#define CEXPR_MAXDEPTH 5
+#define CEXPR_NOT       1
+#define CEXPR_AND       2
+#define CEXPR_OR        3
+#define CEXPR_ATTR      4
+#define CEXPR_NAMES     5
+#define CEXPR_USER      1
+#define CEXPR_ROLE      2
+#define CEXPR_TYPE      4
+#define CEXPR_TARGET    8
+#define CEXPR_XTARGET   16
+#define CEXPR_L1L2      32
+#define CEXPR_L1H2      64
+#define CEXPR_H1L2      128
+#define CEXPR_H1H2      256
+#define CEXPR_L1H1      512
+#define CEXPR_L2H2      1024
+#define CEXPR_EQ        1
+#define CEXPR_NEQ       2
+#define CEXPR_DOM       3
+#define CEXPR_DOMBY     4
+#define CEXPR_INCOMP    5
+#endif
+
 struct constraint_expr {
     u32 expr_type;
     u32 attr;
@@ -501,18 +526,37 @@ static int clean_context_to_struct(const char *query, size_t len,
 static bool clean_ebitmap_contains(const struct ebitmap *a,
                                   const struct ebitmap *b)
 {
-    struct ebitmap_node *node;
-    unsigned int bit;
+    struct ebitmap_node *bn;
 
     if (!a || !b || a->highbit < b->highbit)
         return false;
 
-    ebitmap_for_each_positive_bit_intel((struct ebitmap *)b, node, bit) {
-        if (!clean_ebitmap_test(a, bit))
-            return false;
+    for (bn = b->node; bn; bn = bn->next) {
+        unsigned int map_i;
+
+        for (map_i = 0; map_i < SELINUX_EBITMAP_UNIT_NUMS; map_i++) {
+            unsigned long map = bn->maps[map_i];
+            unsigned int bit_i;
+
+            if (!map)
+                continue;
+
+            for (bit_i = 0; bit_i < SELINUX_EBITMAP_UNIT_BITS; bit_i++) {
+                if (map & (1UL << bit_i)) {
+                    unsigned long bit =
+                        (unsigned long)bn->startbit +
+                        (unsigned long)map_i * SELINUX_EBITMAP_UNIT_BITS +
+                        bit_i;
+                    if (!clean_ebitmap_test(a, bit))
+                        return false;
+                }
+            }
+        }
     }
+
     return true;
 }
+
 
 static bool clean_ebitmap_equal(const struct ebitmap *a,
                                 const struct ebitmap *b)
@@ -599,8 +643,8 @@ static bool clean_constraint_expr_eval(struct policydb *policydb,
                 val2 = tcontext->role;
                 if (!policydb->role_val_to_struct ||
                     !val1 || !val2 ||
-                    val1 > policydb->p_roles.nprim ||
-                    val2 > policydb->p_roles.nprim)
+                    val1 > policydb->symtab[SYM_ROLES].nprim ||
+                    val2 > policydb->symtab[SYM_ROLES].nprim)
                     return false;
                 r1 = policydb->role_val_to_struct[val1 - 1];
                 r2 = policydb->role_val_to_struct[val2 - 1];
