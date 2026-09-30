@@ -4567,6 +4567,28 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     }
 
     manager = current_is_policy_manager();
+
+    /*
+     * 4.4 target: use only the captured clean policy semantics.
+     * Do not consult detector-specific context lists here.
+     */
+    if (selinux_44_compat_path() && !manager) {
+        clean_ret = clean_policy_context_to_sid(sample, &clean_sid);
+        clean_checked = clean_ret <= 0;
+        blocked = clean_ret == -EINVAL;
+
+        uid = current_uid();
+        n = READ_ONCE(g_procattr_current_count) + 1;
+        WRITE_ONCE(g_procattr_current_count, n);
+
+        pr_info("[selinux_hook] AUDIT /proc/self/attr/current 4.4 #%u hook=%s lsm=%s uid=%d comm=%s name_ptr=%px value=%px size=%zu sample_len=%zu manager=%d clean_checked=%d clean_ret=%d clean_sid=%u clean_policydb=%px action=%s forced_ret=%d query=\"%s\"\n",
+                n, hook ?: "?", lsm ?: "-", uid, current_comm(), name, value, size,
+                sample_len, manager, clean_checked,
+                clean_ret, clean_sid, READ_ONCE(g_clean_policydb),
+                blocked ? "block" : "pass", blocked ? -EINVAL : 0, sample);
+        return blocked;
+    }
+
     if (!manager) {
         if (dirtysepolicy_context_should_hide(sample)) {
             clean_checked = true;
