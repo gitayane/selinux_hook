@@ -564,6 +564,7 @@ static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u);
 static void before_policydb_read_legacy(hook_fargs2_t *a, void *u);
 static void before_security_context_to_sid_legacy(hook_fargs4_t *a, void *u);
 static void capture_first_policy_blob(const char *reason, void *data, size_t len);
+static size_t copy_query_sample(char *dst, const char *src, size_t size);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -2131,7 +2132,7 @@ static void before_security_context_to_sid_legacy(hook_fargs4_t *a, void *u)
     if (!dirtysepolicy_context_should_hide(sample))
         return;
 
-    pr_info("[selinux_hook] DIRTYSEPOLICY hide security_context_to_sid uid=%d comm=%s query="%s"\n",
+    pr_info("[selinux_hook] DIRTYSEPOLICY hide security_context_to_sid uid=%d comm=%s query=\"%s\"\n",
             uid, current_comm(), sample);
 
     a->skip_origin = 1;
