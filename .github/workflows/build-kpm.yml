@@ -4,7 +4,11 @@ on:
   push:
     paths:
       - ".github/workflows/build-kpm.yml"
+      - ".gitmodules"
+      - "KernelPatch"
       - "**.c"
+      - "**.h"
+      - "**/Makefile"
 
   workflow_dispatch:
     inputs:
@@ -24,6 +28,7 @@ jobs:
       contents: write
     env:
       TZ: UTC-8
+      EXPECTED_KP_COMMIT: 22ad5c7516475842f79e321b09d5d4e313de8e87
 
     steps:
       - name: Checkout
@@ -42,9 +47,23 @@ jobs:
           tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
 
       - name: Verify KernelPatch source
+        shell: bash
         run: |
-          echo "KernelPatch HEAD: $(git -C KernelPatch rev-parse HEAD)"
-          echo "KernelPatch version: $(cat KernelPatch/version)"
+          set -euo pipefail
+
+          actual="$(git -C KernelPatch rev-parse HEAD)"
+          echo "KernelPatch HEAD: $actual"
+          echo "KernelPatch remote: $(git -C KernelPatch remote get-url origin)"
+          echo "KernelPatch version:"
+          cat KernelPatch/version
+
+          test "$actual" = "$EXPECTED_KP_COMMIT"
+
+          grep -q '^#define MAJOR 0$' KernelPatch/version
+          grep -q '^#define MINOR 13$' KernelPatch/version
+          grep -q '^#define PATCH 9$' KernelPatch/version
+
+          echo "KernelPatch baseline verified: 0.13.9 @ $EXPECTED_KP_COMMIT"
 
       - name: Build kpm
         env:
@@ -55,6 +74,16 @@ jobs:
           for dir in $(ls -d */ | grep -v '^KernelPatch/$\|^target/$\|^arm-gnu-toolchain'); do
             make -C ${dir}
             mv ${dir}*.kpm target
+          done
+
+      - name: Inspect KPM symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          for kpm in target/*.kpm; do
+            echo "=== ${kpm} ==="
+            readelf -h "${kpm}" | sed -n "1,20p"
+            readelf -S "${kpm}" | grep -E "kpm|symtab|strtab|eh_frame|rela.eh_frame" || true
           done
 
       - name: Upload artifact
