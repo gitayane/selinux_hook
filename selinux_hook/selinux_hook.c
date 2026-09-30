@@ -2105,7 +2105,7 @@ static void snapshot_clean_policy(const char *reason)
      * call captured by the PRE_KERNEL_INIT embedded-KPM hook.  Never replace
      * that baseline with a late security_read_policy() snapshot. */
     if (selinux_414_compat_path()) {
-        pr_warn_once("[selinux_hook] 4.4 clean snapshot unavailable yet reason=%s; waiting for first security_load_policy hook\n",
+        pr_warn("[selinux_hook] 4.4 clean snapshot unavailable yet reason=%s; waiting for first security_load_policy hook\n",
                      reason ?: "(null)");
         return;
     }
