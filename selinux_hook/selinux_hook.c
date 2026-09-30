@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.10-preinit"
+#define SELINUX_VERSION "1.1.11-preinit"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
@@ -389,6 +389,13 @@ static struct avtab_node *(*avtab_search_node_fn)(struct avtab *h, struct avtab_
 static struct avtab_node *(*avtab_search_node_next_fn)(struct avtab_node *node, int specified);
 static void (*cond_compute_av_fn)(struct avtab *ctab, struct avtab_key *key,
                                   struct av_decision *avd, struct extended_perms *xperms);
+static void *(*hashtab_search_fn)(struct hashtab *h, const void *key);
+static int (*mls_context_to_sid_fn)(struct policydb *policydb, char oldc,
+                                    char **scontext, struct context *context,
+                                    struct sidtab *sidtab, u32 def_sid);
+static int (*policydb_context_isvalid_fn)(struct policydb *policydb,
+                                          struct context *context);
+static void (*ebitmap_destroy_fn)(struct ebitmap *ebitmap);
 static int (*constraint_expr_eval_fn)(struct policydb *policydb,
                                       struct context *scontext,
                                       struct context *tcontext,
@@ -489,6 +496,9 @@ static bool clean_context_exists(const char *query);
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
 static bool legacy_should_block_access_query(const char *query, size_t len);
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
+static int clean_context_to_struct(const char *query, size_t len,
+                                   struct context *ctx);
+static int clean_access_transaction(char *buf, size_t size);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
@@ -793,6 +803,11 @@ static bool selinux_414_compat_path(void)
     return kver < VERSION(4, 15, 0);
 }
 
+static bool selinux_44_compat_path(void)
+{
+    return kver >= VERSION(4, 4, 0) && kver < VERSION(4, 9, 0);
+}
+
 static bool clean_policydb_redirect_supported(void)
 {
     /*
@@ -1002,6 +1017,10 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("avtab_search_node"),
     SYMBOL_CACHE_ENTRY("avtab_search_node_next"),
     SYMBOL_CACHE_ENTRY("cond_compute_av"),
+    SYMBOL_CACHE_ENTRY("hashtab_search"),
+    SYMBOL_CACHE_ENTRY("mls_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("policydb_context_isvalid"),
+    SYMBOL_CACHE_ENTRY("ebitmap_destroy"),
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
     SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
@@ -4437,7 +4456,8 @@ static long init(const char *args, const char *event, void *__user r)
     /* 4.4 contextExists() hardening: reject only known DirtySepolicy probe
      * contexts at the context->SID boundary.  Root/policy-manager callers
      * continue to use the live policy unchanged. */
-    if (security_context_to_sid_fn && selinux_414_compat_path()) {
+    if (security_context_to_sid_fn && selinux_414_compat_path() &&
+        !selinux_44_compat_path()) {
         g_funcs[g_hooks++] = (void *)security_context_to_sid_fn;
         pr_info("[selinux_hook] hook security_context_to_sid argc=4 mode=dirty-context-filter event=%s\n",
                 event ?: "(null)");
@@ -4472,6 +4492,10 @@ static long init(const char *args, const char *event, void *__user r)
     avtab_search_node_fn = (void *)lookup_name_optional_suffix("avtab_search_node");
     avtab_search_node_next_fn = (void *)lookup_name_optional_suffix("avtab_search_node_next");
     cond_compute_av_fn = (void *)lookup_name_optional_suffix("cond_compute_av");
+    hashtab_search_fn = (void *)lookup_name_optional_suffix("hashtab_search");
+    mls_context_to_sid_fn = (void *)lookup_name_optional_suffix("mls_context_to_sid");
+    policydb_context_isvalid_fn = (void *)lookup_name_optional_suffix("policydb_context_isvalid");
+    ebitmap_destroy_fn = (void *)lookup_name_optional_suffix("ebitmap_destroy");
     constraint_expr_eval_fn = (void *)lookup_name_optional_suffix("constraint_expr_eval");
     type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
     selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
@@ -4488,6 +4512,10 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("avtab_search_node", (void *)avtab_search_node_fn);
     log_symbol_addr("avtab_search_node_next", (void *)avtab_search_node_next_fn);
     log_symbol_addr("cond_compute_av", (void *)cond_compute_av_fn);
+    log_symbol_addr("hashtab_search", (void *)hashtab_search_fn);
+    log_symbol_addr("mls_context_to_sid", (void *)mls_context_to_sid_fn);
+    log_symbol_addr("policydb_context_isvalid", (void *)policydb_context_isvalid_fn);
+    log_symbol_addr("ebitmap_destroy", (void *)ebitmap_destroy_fn);
     log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
     log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
     log_symbol_addr("selinux_policy_cancel", (void *)selinux_policy_cancel_fn);
