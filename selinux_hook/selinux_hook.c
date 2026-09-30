@@ -2899,10 +2899,249 @@ static bool current_status_read_scope_patched(void)
     return patched;
 }
 
+static bool clean_ebitmap_test(const struct ebitmap *bitmap, unsigned long bit)
+{
+    struct ebitmap_node *node;
+    unsigned long rel;
+    unsigned int index;
+    unsigned int offset;
+
+    if (!bitmap)
+        return false;
+
+    for (node = bitmap->node; node; node = node->next) {
+        if (node->startbit > bit)
+            break;
+        rel = bit - node->startbit;
+        if (rel >= (unsigned long)SELINUX_EBITMAP_UNIT_BITS *
+                   (unsigned long)SELINUX_EBITMAP_UNIT_NUMS)
+            continue;
+        index = (unsigned int)(rel / SELINUX_EBITMAP_UNIT_BITS);
+        offset = (unsigned int)(rel % SELINUX_EBITMAP_UNIT_BITS);
+        if (index < SELINUX_EBITMAP_UNIT_NUMS)
+            return !!(node->maps[index] & (1UL << offset));
+    }
+
+    return false;
+}
+
+static int clean_context_to_struct(const char *query, size_t len,
+                                   struct context *ctx)
+{
+    char *buf;
+    char *p;
+    char *part;
+    char oldc;
+    struct policydb *policydb;
+    struct user_datum *usrdatum;
+    struct role_datum *role;
+    struct type_datum *typdatum;
+    int rc = -EINVAL;
+
+    if (!query || !len || !ctx || !vmalloc_fn || !vfree_fn)
+        return -EAGAIN;
+
+    policydb = (struct policydb *)READ_ONCE(g_clean_policydb);
+    if (!policydb || !hashtab_search_fn ||
+        !mls_context_to_sid_fn || !policydb_context_isvalid_fn ||
+        !ebitmap_destroy_fn)
+        return -EAGAIN;
+
+    if (len > 4096)
+        return -EAGAIN;
+
+    buf = (char *)vmalloc_fn((unsigned long)(len + 1));
+    if (!buf)
+        return -EAGAIN;
+
+    copy_bytes(buf, query, len);
+    buf[len] = '\0';
+    zero_bytes(ctx, sizeof(*ctx));
+
+    part = buf;
+    p = part;
+    while (*p && *p != ':')
+        p++;
+    if (!*p)
+        goto out;
+    *p++ = '\0';
+
+    usrdatum = (struct user_datum *)hashtab_search_fn(
+        policydb->symtab[SYM_USERS].table, part);
+    if (!usrdatum)
+        goto out;
+    ctx->user = usrdatum->value;
+
+    part = p;
+    while (*p && *p != ':')
+        p++;
+    if (!*p)
+        goto out;
+    *p++ = '\0';
+
+    role = (struct role_datum *)hashtab_search_fn(
+        policydb->symtab[SYM_ROLES].table, part);
+    if (!role)
+        goto out;
+    ctx->role = role->value;
+
+    part = p;
+    while (*p && *p != ':')
+        p++;
+    oldc = *p;
+    *p++ = '\0';
+
+    typdatum = (struct type_datum *)hashtab_search_fn(
+        policydb->symtab[SYM_TYPES].table, part);
+    if (!typdatum || typdatum->attribute)
+        goto out;
+    ctx->type = typdatum->value;
+
+    rc = mls_context_to_sid_fn(policydb, oldc, &p, ctx, NULL, SECSID_NULL);
+    if (rc)
+        goto out;
+
+    if ((size_t)(p - buf) < len)
+        goto out;
+
+    rc = policydb_context_isvalid_fn(policydb, ctx);
+
+out:
+    if (ebitmap_destroy_fn) {
+        ebitmap_destroy_fn(&ctx->range.level[0].cat);
+        ebitmap_destroy_fn(&ctx->range.level[1].cat);
+    }
+    vfree_fn(buf);
+    return rc;
+}
+
+static int clean_access_transaction(char *buf, size_t size)
+{
+    char *tmp;
+    char *p;
+    char *src;
+    char *dst;
+    char *cls;
+    unsigned long class_value = 0;
+    struct context sctx;
+    struct context tctx;
+    struct av_decision avd;
+    struct extended_perms xperms;
+    struct policydb *policydb;
+    int rc;
+
+    if (!buf || !size || !READ_ONCE(g_clean_policy_blob) ||
+        !vmalloc_fn || !vfree_fn)
+        return 0;
+
+    try_load_clean_policydb_from_blob("4.4_access_query");
+    policydb = (struct policydb *)READ_ONCE(g_clean_policydb);
+    if (!policydb)
+        return 0;
+
+    tmp = (char *)vmalloc_fn((unsigned long)(size + 1));
+    if (!tmp)
+        return 0;
+
+    copy_bytes(tmp, buf, size);
+    tmp[size] = '\0';
+
+    p = tmp;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    src = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        p++;
+    if (!*p) {
+        vfree_fn(tmp);
+        return 0;
+    }
+    *p++ = '\0';
+
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    dst = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        p++;
+    if (!*p) {
+        vfree_fn(tmp);
+        return 0;
+    }
+    *p++ = '\0';
+
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    cls = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        p++;
+    *p = '\0';
+    if (!*cls) {
+        vfree_fn(tmp);
+        return 0;
+    }
+
+    for (p = cls; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            vfree_fn(tmp);
+            return 0;
+        }
+        class_value = class_value * 10 + (unsigned long)(*p - '0');
+        if (class_value > 0xffffUL) {
+            vfree_fn(tmp);
+            return 0;
+        }
+    }
+
+    rc = clean_context_to_struct(src, token_len(src), &sctx);
+    if (rc == -EAGAIN) {
+        vfree_fn(tmp);
+        return 0;
+    }
+    if (rc) {
+        vfree_fn(tmp);
+        return -EINVAL;
+    }
+
+    rc = clean_context_to_struct(dst, token_len(dst), &tctx);
+    if (rc == -EAGAIN) {
+        vfree_fn(tmp);
+        return 0;
+    }
+    if (rc) {
+        vfree_fn(tmp);
+        return -EINVAL;
+    }
+
+    zero_bytes(&avd, sizeof(avd));
+    zero_bytes(&xperms, sizeof(xperms));
+
+    rc = context_struct_compute_av_intel(policydb, &sctx, &tctx,
+                                         (u16)class_value, &avd, &xperms);
+    if (!rc) {
+        vfree_fn(tmp);
+        return 0;
+    }
+
+    avd.seqno = SELINUX_STATUS_CLEAN_POLICYLOAD;
+    avd.flags = clean_ebitmap_test(&policydb->permissive_map,
+                                   sctx.type - 1)
+                  ? AVD_FLAGS_PERMISSIVE : 0;
+
+    rc = scnprintf(buf, size, "%x %x %x %x %u %x",
+                   avd.allowed, 0xffffffffU,
+                   avd.auditallow, avd.auditdeny,
+                   avd.seqno, avd.flags);
+
+    vfree_fn(tmp);
+    return (rc > 0 && (size_t)rc < size) ? rc : 0;
+}
+
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
 {
     const char *ctx;
     size_t len;
+    struct context parsed;
+    int rc;
 
     if (!query || !out_sid)
         return -EINVAL;
@@ -2913,12 +3152,22 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
         return -EINVAL;
 
     if (!READ_ONCE(g_clean_policy_blob))
-        return 1; /* 没有可用的 clean blob，交给上层走别的判断 */
+        return 1;
 
-    if (out_sid)
-        *out_sid = 0;
+    try_load_clean_policydb_from_blob("4.4_context_query");
+    if (!READ_ONCE(g_clean_policydb))
+        return 1;
 
-    return clean_context_exists(ctx) ? 0 : -EINVAL;
+    rc = clean_context_to_struct(ctx, len, &parsed);
+    if (rc == -EAGAIN)
+        return 1;
+    if (rc) {
+        *out_sid = SECSID_NULL;
+        return -EINVAL;
+    }
+
+    *out_sid = parsed.type;
+    return 0;
 }
 
 /* Hook: selinux_complete_init */
