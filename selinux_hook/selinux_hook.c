@@ -140,6 +140,10 @@ struct context {
     u32 hash;
 };
 
+#ifndef POLICYDB_BOUNDS_MAXDEPTH
+#define POLICYDB_BOUNDS_MAXDEPTH 4
+#endif
+
 #ifndef CEXPR_MAXDEPTH
 #define CEXPR_MAXDEPTH 5
 #define CEXPR_NOT       1
@@ -1856,7 +1860,6 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
                                             struct av_decision *avd,
                                             struct extended_perms *xperms)
 {
-    struct constraint_node *constraint;
     struct role_allow *ra;
     struct avtab_key avkey;
     struct avtab_node *node;
