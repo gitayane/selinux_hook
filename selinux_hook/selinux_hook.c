@@ -3007,7 +3007,7 @@ static int clean_context_to_struct(const char *query, size_t len,
     rc = policydb_context_isvalid_fn(policydb, ctx);
 
 out:
-    if (ebitmap_destroy_fn) {
+    if (rc && ebitmap_destroy_fn) {
         ebitmap_destroy_fn(&ctx->range.level[0].cat);
         ebitmap_destroy_fn(&ctx->range.level[1].cat);
     }
@@ -3471,6 +3471,42 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
             log_bypass_once("access", uid, sample);
         return;
     }
+    if (selinux_44_compat_path()) {
+        int clean_rc = clean_access_transaction((char *)a->arg1, size);
+
+        if (clean_rc < 0) {
+            a->local.data0 = 6;
+            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
+            WRITE_ONCE(g_clean_access_count, a->local.data1);
+            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
+            g_probes[a->local.data2].id = a->local.data1;
+            g_probes[a->local.data2].uid = uid;
+            g_probes[a->local.data2].node = "access";
+            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
+            a->skip_origin = 1;
+            a->ret = (uint64_t)-EINVAL;
+            pr_info("[selinux_hook] CLEAN reject /sys/fs/selinux/access uid=%d comm=%s query=\"%s\"\n",
+                    uid, current_comm(), sample);
+            return;
+        }
+
+        if (clean_rc > 0) {
+            a->local.data0 = 6;
+            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
+            WRITE_ONCE(g_clean_access_count, a->local.data1);
+            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
+            g_probes[a->local.data2].id = a->local.data1;
+            g_probes[a->local.data2].uid = uid;
+            g_probes[a->local.data2].node = "access";
+            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
+            a->skip_origin = 1;
+            a->ret = (uint64_t)clean_rc;
+            pr_info("[selinux_hook] CLEAN /sys/fs/selinux/access uid=%d comm=%s ret=%d query=\"%s\"\n",
+                    uid, current_comm(), clean_rc, sample);
+            return;
+        }
+    }
+
 
     if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
         long ret;
@@ -3611,6 +3647,27 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
             log_bypass_once("context", uid, sample);
         return;
     }
+    if (selinux_44_compat_path()) {
+        u32 clean_sid = SECSID_NULL;
+        int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
+
+        if (clean_rc < 0) {
+            a->local.data0 = 6;
+            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
+            WRITE_ONCE(g_clean_access_count, a->local.data1);
+            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
+            g_probes[a->local.data2].id = a->local.data1;
+            g_probes[a->local.data2].uid = uid;
+            g_probes[a->local.data2].node = "context";
+            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
+            a->skip_origin = 1;
+            a->ret = (uint64_t)-EINVAL;
+            pr_info("[selinux_hook] CLEAN reject /sys/fs/selinux/context uid=%d comm=%s query=\"%s\"\n",
+                    uid, current_comm(), sample);
+            return;
+        }
+    }
+
 
     if (dirtysepolicy_context_should_hide(sample)) {
         n = READ_ONCE(g_clean_access_count) + 1;
