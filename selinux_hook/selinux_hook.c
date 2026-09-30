@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.8-preinit"
+#define SELINUX_VERSION "1.1.9-preinit"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
@@ -551,6 +551,7 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
 static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u);
+static void before_policydb_read_legacy(hook_fargs2_t *a, void *u);
 static void capture_first_policy_blob(const char *reason, void *data, size_t len);
 
 /*
@@ -2048,7 +2049,45 @@ static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u)
     data = (void *)a->arg0;
     len = (size_t)a->arg1;
 
+    pr_info("[selinux_hook] security_load_policy entered before first-policy capture data=%px len=%zu\n",
+            data, len);
     capture_first_policy_blob("security_load_policy:first", data, len);
+}
+
+/*
+ * Linux 4.4 fallback: policydb_read() is called by security_load_policy()
+ * with the original policy_file before the parser mutates fp->data/fp->len.
+ * If the security_load_policy inline hook is unavailable, this still gives us
+ * the pristine first Android policy. Only capture before SELinux completes;
+ * a later APatch/magiskpolicy load must never become the clean baseline.
+ */
+static void before_policydb_read_legacy(hook_fargs2_t *a, void *u)
+{
+    struct policy_file *fp;
+    void *data;
+    size_t len;
+
+    if (!a || !selinux_414_compat_path())
+        return;
+    if (READ_ONCE(g_selinux_ready))
+        return;
+    if (READ_ONCE(g_internal_policy_load_depth))
+        return;
+    if (READ_ONCE(g_clean_policy_blob))
+        return;
+
+    fp = (struct policy_file *)a->arg1;
+    if (!fp)
+        return;
+
+    data = READ_ONCE(fp->data);
+    len = READ_ONCE(fp->len);
+    if (!data || !len)
+        return;
+
+    pr_info("[selinux_hook] policydb_read entered before first-policy capture data=%px len=%zu\n",
+            data, len);
+    capture_first_policy_blob("policydb_read:first", data, len);
 }
 
 static void snapshot_clean_policy(const char *reason)
@@ -4281,6 +4320,8 @@ static long init(const char *args, const char *event, void *__user r)
     int rc;
 
     selinux_hook_dbg("[selinux_hook] init event=%s\n", event ?: "(null)");
+    if (event && !event_is_post_init(event))
+        pr_info("[selinux_hook] PRE_KERNEL_INIT entry: first-policy hooks will run before Android SELinux policy load\n");
 
     /* Initialize clean status bytes based on kernel version */
     fill_clean_status_bytes(g_clean_status_bytes);
@@ -4365,6 +4406,22 @@ static long init(const char *args, const char *event, void *__user r)
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
     policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
     policydb_destroy_fn = (void *)lookup_name_optional_suffix("policydb_destroy");
+
+    /* 4.4 fallback: capture the pristine blob at policydb_read() if the
+     * security_load_policy() hook cannot be installed or never fires. */
+    if (policydb_read_fn && selinux_414_compat_path()) {
+        g_funcs[g_hooks++] = (void *)policydb_read_fn;
+        pr_info("[selinux_hook] hook policydb_read argc=2 mode=first-policy-fallback event=%s\n",
+                event ?: "(null)");
+        if (hook_wrap((void *)policydb_read_fn, 2,
+                      before_policydb_read_legacy, NULL, NULL)) {
+            g_hooks--;
+            g_funcs[g_hooks] = NULL;
+            pr_err("[selinux_hook] hook policydb_read argc=2 failed\n");
+        } else {
+            pr_info("[selinux_hook] policydb_read first-policy fallback hook ready\n");
+        }
+    }
     flex_array_get_fn = (void *)lookup_name_optional_suffix("flex_array_get");
     avtab_search_node_fn = (void *)lookup_name_optional_suffix("avtab_search_node");
     avtab_search_node_next_fn = (void *)lookup_name_optional_suffix("avtab_search_node_next");
