@@ -84,6 +84,8 @@ jobs:
             echo "=== ${kpm} ==="
             readelf -h "${kpm}" | sed -n "1,20p"
             readelf -S "${kpm}" | grep -E "kpm|symtab|strtab|eh_frame|rela.eh_frame" || true
+            echo "--- undefined symbols ---"
+            readelf -Ws "${kpm}" | awk '$7 == "UND" {print}'
           done
 
       - name: Upload artifact
