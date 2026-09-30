@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7"
+#define SELINUX_VERSION "1.1.8-preinit"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
@@ -441,6 +441,7 @@ static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 static bool g_simple_read_from_buffer_hooked;
+static bool g_security_load_policy_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
 struct access_probe {
@@ -548,6 +549,8 @@ static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
+static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u);
+static void capture_first_policy_blob(const char *reason, void *data, size_t len);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -1979,6 +1982,74 @@ static void try_load_clean_policydb_from_blob(const char *reason)
             reason ?: "(null)", policydb, blob, len, CLEAN_POLICYDB_ALLOC_SIZE);
 }
 
+
+/*
+ * PRE_KERNEL_INIT / 4.4 legacy policy capture.
+ *
+ * On Linux 4.4, security_load_policy(void *data, size_t len) receives the
+ * policy blob immediately before policydb_read() installs it into the live
+ * global policydb.  An embedded KPM loaded at PRE_KERNEL_INIT can therefore
+ * capture this first blob without calling security_read_policy() after the
+ * policy has already been modified by APatch/Magisk.
+ *
+ * This path deliberately does not call policydb_read() from the hook itself:
+ * keep the policy-load critical path as close to the original kernel path as
+ * possible, and parse the saved blob only from the later legacy probe path.
+ */
+static void capture_first_policy_blob(const char *reason, void *data, size_t len)
+{
+    void *copy;
+
+    if (READ_ONCE(g_clean_policy_blob))
+        return;
+    if (!data || !len || len > 64UL * 1024UL * 1024UL)
+        return;
+    if (!vmalloc_fn) {
+        pr_warn("[selinux_hook] first policy capture skipped: vmalloc unavailable reason=%s\n",
+                reason ?: "(null)");
+        return;
+    }
+
+    copy = vmalloc_fn((unsigned long)len);
+    if (!copy) {
+        pr_warn("[selinux_hook] first policy capture alloc failed reason=%s len=%zu\n",
+                reason ?: "(null)", len);
+        return;
+    }
+
+    copy_bytes(copy, data, len);
+
+    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(copy, len));
+    WRITE_ONCE(g_clean_policy_len, len);
+    WRITE_ONCE(g_clean_policy_blob, copy);
+
+    pr_info("[selinux_hook] FIRST POLICY CAPTURE reason=%s blob=%px len=%zu has_magisk=%d source=%px\n",
+            reason ?: "(null)", copy, len,
+            READ_ONCE(g_clean_policy_has_magisk), data);
+}
+
+/*
+ * Linux 4.4 security_load_policy(void *data, size_t len).
+ * Capture only the first load and never alter arguments or the return value.
+ */
+static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u)
+{
+    void *data;
+    size_t len;
+
+    if (!a || !selinux_414_compat_path())
+        return;
+    if (READ_ONCE(g_internal_policy_load_depth))
+        return;
+    if (READ_ONCE(g_clean_policy_blob))
+        return;
+
+    data = (void *)a->arg0;
+    len = (size_t)a->arg1;
+
+    capture_first_policy_blob("security_load_policy:first", data, len);
+}
+
 static void snapshot_clean_policy(const char *reason)
 {
     void *data = NULL;
@@ -1989,6 +2060,15 @@ static void snapshot_clean_policy(const char *reason)
         return;
     if (READ_ONCE(g_dirty_policy_seen))
         return;
+
+    /* On 4.4 the clean baseline must come from the first security_load_policy()
+     * call captured by the PRE_KERNEL_INIT embedded-KPM hook.  Never replace
+     * that baseline with a late security_read_policy() snapshot. */
+    if (selinux_414_compat_path()) {
+        pr_warn_once("[selinux_hook] 4.4 clean snapshot unavailable yet reason=%s; waiting for first security_load_policy hook\n",
+                     reason ?: "(null)");
+        return;
+    }
 
     if (try_snapshot_mock_policy(reason)) {
         if (use_clean_blob_route()) {
@@ -2758,7 +2838,10 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 {
     WRITE_ONCE(g_selinux_ready, true);
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
-    snapshot_clean_policy("complete_init");
+    if (selinux_414_compat_path() && !READ_ONCE(g_clean_policy_blob))
+        pr_warn("[selinux_hook] 4.4 first-policy capture did NOT fire before selinux_complete_init\n");
+    else
+        snapshot_clean_policy("complete_init");
     try_complete_deferred_write_op_install("complete_init");
 }
 
@@ -4258,6 +4341,25 @@ static long init(const char *args, const char *event, void *__user r)
         detect_apatch_manager_uid();
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
     security_load_policy_compat_fn = (void *)security_load_policy_fn;
+
+    /*
+     * Embedded KPM is loaded during PRE_KERNEL_INIT, before Android init loads
+     * the first SELinux policy.  On the 4.4 legacy ABI, hook the two-argument
+     * security_load_policy() now so the incoming blob becomes our clean baseline.
+     */
+    if (security_load_policy_fn && selinux_414_compat_path()) {
+        g_funcs[g_hooks++] = (void *)security_load_policy_fn;
+        pr_info("[selinux_hook] hook security_load_policy argc=2 mode=first-policy-capture event=%s\n",
+                event ?: "(null)");
+        if (hook_wrap((void *)security_load_policy_fn, 2,
+                      before_security_load_policy_legacy, NULL, NULL)) {
+            g_hooks--;
+            g_funcs[g_hooks] = NULL;
+            pr_err("[selinux_hook] hook security_load_policy argc=2 failed\n");
+        } else {
+            WRITE_ONCE(g_security_load_policy_hooked, true);
+        }
+    }
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
     policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
@@ -4298,15 +4400,19 @@ static long init(const char *args, const char *event, void *__user r)
     if (!sidtab_cancel_convert_fn)
         pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
     /*
-     * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
-     * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
+     * Legacy 4.4 path:
+     * security_read_policy() is intentionally NOT used to establish the clean
+     * baseline.  The first policy blob is captured by the security_load_policy
+     * hook installed above, before Android init commits it.
      */
     if (!security_read_policy_fn) {
         pr_warn("[selinux_hook] cannot find security_read_policy, clean policy snapshot disabled\n");
     } else if (selinux_49_compat_path()) {
         pr_warn("[selinux_hook] skip security_read_policy snapshot on 4.9: helper ABI is device-specific\n");
-    } else {
+    } else if (!selinux_414_compat_path()) {
         snapshot_clean_policy("module_init");
+    } else {
+        pr_info("[selinux_hook] 4.4 clean baseline deferred to first security_load_policy()\n");
     }
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
@@ -4394,8 +4500,11 @@ static long init(const char *args, const char *event, void *__user r)
 
     if (!security_load_policy_fn) {
         pr_warn("[selinux_hook] cannot find security_load_policy, live policy load audit disabled\n");
+    } else if (selinux_414_compat_path()) {
+        pr_info("[selinux_hook] security_load_policy first-policy capture hook=%d\n",
+                READ_ONCE(g_security_load_policy_hooked) ? 1 : 0);
     } else {
-        selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped; clean snapshots call it directly\n");
+        selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped on non-legacy path; clean snapshots use the existing staged/blob route\n");
     }
 
     /* setprocattr ABI split / setprocattr ABI 分叉：4.9 是 task-first，其他内核走原签名探测。 */
@@ -4536,6 +4645,7 @@ static long init(const char *args, const char *event, void *__user r)
 static long exit_(void *__user r)
 {
     WRITE_ONCE(g_write_op_install_deferred, false);
+    WRITE_ONCE(g_security_load_policy_hooked, false);
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
 
