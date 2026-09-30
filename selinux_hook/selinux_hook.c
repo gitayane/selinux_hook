@@ -32,6 +32,7 @@ KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
+/* CI marker: rebuild after Makefile version bump; no runtime behavior. */
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
