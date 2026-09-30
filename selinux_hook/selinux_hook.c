@@ -84,6 +84,7 @@ static int (*security_read_policy_compat_fn)(void *state, void **data, size_t *l
 static int (*security_load_policy_fn)(void *data, size_t len, struct selinux_load_state *load_state);
 static int (*security_load_policy_compat_fn)(void *state, void *data, size_t len,
                                              struct selinux_load_state *load_state);
+struct sidtab;
 static int (*security_context_to_sid_fn)(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 static int (*security_context_to_sid_compat_fn)(void *state, const char *scontext, u32 scontext_len,
                                                 u32 *out_sid, gfp_t gfp);
@@ -523,6 +524,14 @@ static bool legacy_should_block_access_query(const char *query, size_t len);
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
 static int clean_context_to_struct(const char *query, size_t len,
                                    struct context *ctx);
+static bool clean_ebitmap_test(const struct ebitmap *bitmap, unsigned long bit);
+static void zero_bytes(void *dst, size_t len);
+static bool context_struct_compute_av_intel(struct policydb *policydb,
+                                            struct context *scontext,
+                                            struct context *tcontext,
+                                            u16 tclass,
+                                            struct av_decision *avd,
+                                            struct extended_perms *xperms);
 static bool clean_ebitmap_contains(const struct ebitmap *a,
                                   const struct ebitmap *b)
 {
