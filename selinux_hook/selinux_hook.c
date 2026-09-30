@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.9-preinit"
+#define SELINUX_VERSION "1.1.10-preinit"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
@@ -552,6 +552,7 @@ static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
 static void before_security_load_policy_legacy(hook_fargs2_t *a, void *u);
 static void before_policydb_read_legacy(hook_fargs2_t *a, void *u);
+static void before_security_context_to_sid_legacy(hook_fargs4_t *a, void *u);
 static void capture_first_policy_blob(const char *reason, void *data, size_t len);
 
 /*
@@ -2088,6 +2089,34 @@ static void before_policydb_read_legacy(hook_fargs2_t *a, void *u)
     pr_info("[selinux_hook] policydb_read entered before first-policy capture data=%px len=%zu\n",
             data, len);
     capture_first_policy_blob("policydb_read:first", data, len);
+}
+
+static void before_security_context_to_sid_legacy(hook_fargs4_t *a, void *u)
+{
+    const char *query;
+    size_t len;
+    char sample[ACCESS_SAMPLE_MAX];
+    size_t sample_len;
+    uid_t uid;
+
+    if (!a || !selinux_414_compat_path())
+        return;
+
+    uid = current_uid();
+    if (uid < 10000 || current_is_policy_manager())
+        return;
+
+    query = (const char *)a->arg0;
+    len = (size_t)a->arg1;
+    sample_len = copy_query_sample(sample, query, len);
+    if (!dirtysepolicy_context_should_hide(sample))
+        return;
+
+    pr_info("[selinux_hook] DIRTYSEPOLICY hide security_context_to_sid uid=%d comm=%s query="%s"\n",
+            uid, current_comm(), sample);
+
+    a->skip_origin = 1;
+    a->ret = -EINVAL;
 }
 
 static void snapshot_clean_policy(const char *reason)
@@ -4404,6 +4433,23 @@ static long init(const char *args, const char *event, void *__user r)
     }
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
+
+    /* 4.4 contextExists() hardening: reject only known DirtySepolicy probe
+     * contexts at the context->SID boundary.  Root/policy-manager callers
+     * continue to use the live policy unchanged. */
+    if (security_context_to_sid_fn && selinux_414_compat_path()) {
+        g_funcs[g_hooks++] = (void *)security_context_to_sid_fn;
+        pr_info("[selinux_hook] hook security_context_to_sid argc=4 mode=dirty-context-filter event=%s\n",
+                event ?: "(null)");
+        if (hook_wrap((void *)security_context_to_sid_fn, 4,
+                      before_security_context_to_sid_legacy, NULL, NULL)) {
+            g_hooks--;
+            g_funcs[g_hooks] = NULL;
+            pr_err("[selinux_hook] hook security_context_to_sid argc=4 failed\n");
+        } else {
+            pr_info("[selinux_hook] security_context_to_sid dirty-context filter ready\n");
+        }
+    }
     policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
     policydb_destroy_fn = (void *)lookup_name_optional_suffix("policydb_destroy");
 
