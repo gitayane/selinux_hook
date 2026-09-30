@@ -3911,7 +3911,11 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         }
     }
 
-
+    /*
+     * If clean-policy evaluation is unavailable on the 4.4 target, preserve
+     * the origin query rather than falling back to detector-specific rules.
+     */
+    return;
     if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
         long ret;
 
@@ -4072,6 +4076,11 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         }
     }
 
+    /*
+     * Evaluator unavailable: do not fall back to detector-specific context
+     * names on the 4.4 target.
+     */
+    return;
 
     if (dirtysepolicy_context_should_hide(sample)) {
         n = READ_ONCE(g_clean_access_count) + 1;
