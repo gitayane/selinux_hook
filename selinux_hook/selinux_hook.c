@@ -3413,9 +3413,18 @@ static int clean_context_to_struct(const char *query, size_t len,
         goto out;
     }
 
+    /*
+     * Linux 4.4 policydb_context_isvalid() returns 1 for valid and 0 for
+     * invalid.  The clean evaluator contract is 0 == success, < 0 == error,
+     * so normalize the kernel helper's boolean result here.
+     */
     rc = policydb_context_isvalid_fn(policydb, ctx);
-    if (!rc)
+    if (!rc) {
         fail_stage = "policydb_context_isvalid";
+        rc = -EINVAL;
+    } else {
+        rc = 0;
+    }
 
 out:
     if (rc < 0 && READ_ONCE(g_44_clean_eval_fail_count) < 64) {
