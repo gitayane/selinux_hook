@@ -469,6 +469,9 @@ static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
+static u32 g_44_clean_eval_fail_count;
+static u32 g_44_clean_shadow_access_count;
+static u32 g_44_clean_shadow_context_count;
 static u32 g_internal_policy_load_depth;
 static u32 g_procattr_current_count;
 static u32 g_setprocattr_probe_count;
@@ -3311,6 +3314,7 @@ static bool clean_ebitmap_test(const struct ebitmap *bitmap, unsigned long bit)
 static int clean_context_to_struct(const char *query, size_t len,
                                    struct context *ctx)
 {
+    const char *fail_stage = "init";
     char *buf;
     char *p;
     char *part;
@@ -3321,21 +3325,29 @@ static int clean_context_to_struct(const char *query, size_t len,
     struct type_datum *typdatum;
     int rc = -EINVAL;
 
-    if (!query || !len || !ctx || !vmalloc_fn || !vfree_fn)
+    if (!query || !len || !ctx || !vmalloc_fn || !vfree_fn) {
+        fail_stage = "args";
         return -EAGAIN;
+    }
 
     policydb = (struct policydb *)READ_ONCE(g_clean_policydb);
     if (!policydb || !hashtab_search_fn ||
         !mls_context_to_sid_fn || !policydb_context_isvalid_fn ||
-        !ebitmap_destroy_fn)
+        !ebitmap_destroy_fn) {
+        fail_stage = "deps";
         return -EAGAIN;
+    }
 
-    if (len > 4096)
+    if (len > 4096) {
+        fail_stage = "len";
         return -EAGAIN;
+    }
 
     buf = (char *)vmalloc_fn((unsigned long)(len + 1));
-    if (!buf)
+    if (!buf) {
+        fail_stage = "alloc";
         return -EAGAIN;
+    }
 
     copy_bytes(buf, query, len);
     buf[len] = '\0';
@@ -3345,27 +3357,35 @@ static int clean_context_to_struct(const char *query, size_t len,
     p = part;
     while (*p && *p != ':')
         p++;
-    if (!*p)
+    if (!*p) {
+        fail_stage = "user_delim";
         goto out;
+    }
     *p++ = '\0';
 
     usrdatum = (struct user_datum *)hashtab_search_fn(
         policydb->symtab[SYM_USERS].table, part);
-    if (!usrdatum)
+    if (!usrdatum) {
+        fail_stage = "user_missing";
         goto out;
+    }
     ctx->user = usrdatum->value;
 
     part = p;
     while (*p && *p != ':')
         p++;
-    if (!*p)
+    if (!*p) {
+        fail_stage = "role_delim";
         goto out;
+    }
     *p++ = '\0';
 
     role = (struct role_datum *)hashtab_search_fn(
         policydb->symtab[SYM_ROLES].table, part);
-    if (!role)
+    if (!role) {
+        fail_stage = "role_missing";
         goto out;
+    }
     ctx->role = role->value;
 
     part = p;
@@ -3376,25 +3396,59 @@ static int clean_context_to_struct(const char *query, size_t len,
 
     typdatum = (struct type_datum *)hashtab_search_fn(
         policydb->symtab[SYM_TYPES].table, part);
-    if (!typdatum || typdatum->attribute)
+    if (!typdatum || typdatum->attribute) {
+        fail_stage = typdatum ? "type_attribute" : "type_missing";
         goto out;
+    }
     ctx->type = typdatum->value;
 
     rc = mls_context_to_sid_fn(policydb, oldc, &p, ctx, NULL, SECSID_NULL);
-    if (rc)
+    if (rc) {
+        fail_stage = "mls";
         goto out;
+    }
 
-    if ((size_t)(p - buf) < len)
+    if ((size_t)(p - buf) < len) {
+        fail_stage = "trailing";
         goto out;
+    }
 
     rc = policydb_context_isvalid_fn(policydb, ctx);
+    if (!rc)
+        fail_stage = "policydb_context_isvalid";
 
 out:
+    if (rc < 0 && READ_ONCE(g_44_clean_eval_fail_count) < 64) {
+        u32 n = READ_ONCE(g_44_clean_eval_fail_count) + 1;
+        WRITE_ONCE(g_44_clean_eval_fail_count, n);
+        pr_info("[selinux_hook] CLEAN44 context-eval-fail #%u stage=%s rc=%d len=%zu user=%u role=%u type=%u query=\"%s\"\n",
+                n, fail_stage, rc, len, ctx ? ctx->user : 0, ctx ? ctx->role : 0,
+                ctx ? ctx->type : 0, query ?: "");
+    }
+    if (rc == 0 && !fail_stage[0])
+        pr_info("[selinux_hook] CLEAN44 context-eval-valid query=\"%s\"\n", query ?: "");
     if (rc && ebitmap_destroy_fn) {
         ebitmap_destroy_fn(&ctx->range.level[0].cat);
         ebitmap_destroy_fn(&ctx->range.level[1].cat);
     }
     vfree_fn(buf);
+    return rc;
+}
+
+static int clean_access_transaction_shadow(const char *buf, size_t size)
+{
+    char *tmp;
+    int rc;
+
+    if (!buf || !size || !vmalloc_fn || !vfree_fn)
+        return 0;
+    tmp = (char *)vmalloc_fn((unsigned long)(size + 1));
+    if (!tmp)
+        return 0;
+    copy_bytes(tmp, buf, size);
+    tmp[size] = '\0';
+    rc = clean_access_transaction(tmp, size);
+    vfree_fn(tmp);
     return rc;
 }
 
@@ -3875,42 +3929,17 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
             log_bypass_once("access", uid, sample);
         return;
     }
-    if (selinux_44_compat_path()) {
-        int clean_rc = clean_access_transaction((char *)a->arg1, size);
-
-        if (clean_rc < 0) {
-            a->local.data0 = 6;
-            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
-            WRITE_ONCE(g_clean_access_count, a->local.data1);
-            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
-            g_probes[a->local.data2].id = a->local.data1;
-            g_probes[a->local.data2].uid = uid;
-            g_probes[a->local.data2].node = "access";
-            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
-            a->skip_origin = 1;
-            a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN reject /sys/fs/selinux/access uid=%d comm=%s query=\"%s\"\n",
-                    uid, current_comm(), sample);
-            return;
-        }
-
-        if (clean_rc > 0) {
-            a->local.data0 = 6;
-            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
-            WRITE_ONCE(g_clean_access_count, a->local.data1);
-            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
-            g_probes[a->local.data2].id = a->local.data1;
-            g_probes[a->local.data2].uid = uid;
-            g_probes[a->local.data2].node = "access";
-            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
-            a->skip_origin = 1;
-            a->ret = (uint64_t)clean_rc;
-            pr_info("[selinux_hook] CLEAN /sys/fs/selinux/access uid=%d comm=%s ret=%d query=\"%s\"\n",
-                    uid, current_comm(), clean_rc, sample);
-            return;
-        }
+    /* 4.4 shadow evaluation: never modify or reject the live SELinux transaction. */
+    if (selinux_44_compat_path() && uid >= 10000 &&
+        READ_ONCE(g_44_clean_shadow_access_count) < 64) {
+        int clean_rc = clean_access_transaction_shadow((const char *)a->arg1, size);
+        u32 n = READ_ONCE(g_44_clean_shadow_access_count) + 1;
+        WRITE_ONCE(g_44_clean_shadow_access_count, n);
+        pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s clean_ret=%d query=\"%s\"\n",
+                n, uid, current_comm(), clean_rc, sample);
     }
 
+    return;
     /*
      * If clean-policy evaluation is unavailable on the 4.4 target, preserve
      * the origin query rather than falling back to detector-specific rules.
@@ -4055,27 +4084,18 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
             log_bypass_once("context", uid, sample);
         return;
     }
-    if (selinux_44_compat_path()) {
+    /* 4.4 shadow evaluation: never modify or reject the live SELinux transaction. */
+    if (selinux_44_compat_path() && uid >= 10000 &&
+        READ_ONCE(g_44_clean_shadow_context_count) < 64) {
         u32 clean_sid = SECSID_NULL;
         int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
-
-        if (clean_rc < 0) {
-            a->local.data0 = 6;
-            a->local.data1 = READ_ONCE(g_clean_access_count) + 1;
-            WRITE_ONCE(g_clean_access_count, a->local.data1);
-            a->local.data2 = a->local.data1 & (ACCESS_PROBE_SLOTS - 1);
-            g_probes[a->local.data2].id = a->local.data1;
-            g_probes[a->local.data2].uid = uid;
-            g_probes[a->local.data2].node = "context";
-            copy_bytes(g_probes[a->local.data2].query, sample, ACCESS_SAMPLE_MAX);
-            a->skip_origin = 1;
-            a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN reject /sys/fs/selinux/context uid=%d comm=%s query=\"%s\"\n",
-                    uid, current_comm(), sample);
-            return;
-        }
+        u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
+        WRITE_ONCE(g_44_clean_shadow_context_count, n);
+        pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query=\"%s\"\n",
+                n, uid, current_comm(), clean_rc, clean_sid, sample);
     }
 
+    return;
     /*
      * Evaluator unavailable: do not fall back to detector-specific context
      * names on the 4.4 target.
