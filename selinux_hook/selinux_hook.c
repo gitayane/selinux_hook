@@ -3425,7 +3425,7 @@ out:
                 n, fail_stage, rc, len, ctx ? ctx->user : 0, ctx ? ctx->role : 0,
                 ctx ? ctx->type : 0, query ?: "");
     }
-    if (rc == 0 && !fail_stage[0])
+    if (rc > 0 && READ_ONCE(g_44_clean_eval_fail_count) < 64)
         pr_info("[selinux_hook] CLEAN44 context-eval-valid query=\"%s\"\n", query ?: "");
     if (rc && ebitmap_destroy_fn) {
         ebitmap_destroy_fn(&ctx->range.level[0].cat);
