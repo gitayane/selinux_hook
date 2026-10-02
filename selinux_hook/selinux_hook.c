@@ -910,17 +910,14 @@ static bool clean_type_attribute_bounds_av(struct policydb *policydb,
                                           struct av_decision *avd,
                                           unsigned int depth);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
+static bool selinux_44_compat_path(void);
 /*
  * Linux 4.4 caller gate copied from the kernel4.4_selinux_clean patch
  * semantics: clean-policy answers are exposed to app_zygote callers only.
- * We identify the caller by its live SELinux SID, but derive the SID from
- * the live policy at runtime instead of hardcoding a numeric UID/SID.
  *
- * struct task_security_struct on the 4.4 SELinux tree starts with:
- *   u32 osid;
- *   u32 sid;
- * so current->security can be read without depending on the private SELinux
- * header layout beyond the fields actually used here.
+ * KernelPatch intentionally keeps struct task_struct opaque in its KPM headers,
+ * but exposes task_struct_offset.security_offset.  Use that offset rather than
+ * dereferencing current->security directly.
  */
 struct kp_task_security_44 {
     u32 osid;
@@ -930,11 +927,21 @@ struct kp_task_security_44 {
 static u32 current_selinux_sid_44(void)
 {
     const struct kp_task_security_44 *tsec;
+    void *task_security;
+    long off;
 
-    if (!current || !current->security)
+    if (!current)
         return 0;
 
-    tsec = (const struct kp_task_security_44 *)current->security;
+    off = (long)task_struct_offset.security_offset;
+    if (off < 0)
+        return 0;
+
+    task_security = *(void **)((uintptr_t)current + (uintptr_t)off);
+    if (!task_security)
+        return 0;
+
+    tsec = (const struct kp_task_security_44 *)task_security;
     return READ_ONCE(tsec->sid);
 }
 
@@ -949,9 +956,15 @@ static u32 resolve_app_zygote_sid_44(void)
     if (!security_context_to_sid_fn)
         return 0;
 
+    /*
+     * KernelPatch's gfp.h intentionally comments out GFP_KERNEL.  On the
+     * Linux 4.4 allocator ABI used by this compatibility path:
+     *   __GFP_WAIT = 0x10, __GFP_IO = 0x40, __GFP_FS = 0x80,
+     * so GFP_KERNEL == 0xD0.
+     */
     rc = security_context_to_sid_fn(app_zygote_ctx,
                                     (u32)(sizeof(app_zygote_ctx) - 1),
-                                    &sid, GFP_KERNEL);
+                                    &sid, (gfp_t)0xD0U);
     if (rc)
         return 0;
 
@@ -979,6 +992,20 @@ static bool current_is_app_zygote_44(void)
  * "adbroot" is a ROM/debug type that is present in the pristine policy itself,
  * so merely switching to the pristine policydb would still expose it.
  */
+static bool clean44_bytes_equal(const char *a, const char *b, size_t len)
+{
+    size_t i;
+
+    if (!a || !b)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (a[i] != b[i])
+            return false;
+    }
+    return true;
+}
+
 static bool clean44_denied_context_type(const char *ctx)
 {
     const char *p;
@@ -1006,7 +1033,7 @@ static bool clean44_denied_context_type(const char *ctx)
     len = (size_t)(end - p);
 
     return len == sizeof(denied) - 1 &&
-           !memcmp(p, denied, sizeof(denied) - 1);
+           clean44_bytes_equal(p, denied, sizeof(denied) - 1);
 }
 
 static bool clean44_access_edge_denied_for_app_zygote(const char *query)
@@ -1080,9 +1107,9 @@ static bool clean44_access_edge_denied_for_app_zygote(const char *query)
             while (*tt_end && *tt_end != ':') tt_end++;
 
             if ((size_t)(src_type_end - (src_second + 1)) == 14 &&
-                !memcmp(src_second + 1, "fsck_untrusted", 14) &&
+                clean44_bytes_equal(src_second + 1, "fsck_untrusted", 14) &&
                 (size_t)(tt_end - tp) == 14 &&
-                !memcmp(tp, "fsck_untrusted", 14))
+                clean44_bytes_equal(tp, "fsck_untrusted", 14))
                 return true;
         }
     }
@@ -1107,7 +1134,7 @@ static bool clean44_access_edge_denied_for_app_zygote(const char *query)
         while (*te && *te != ':') te++;
 
         return (size_t)(te - tp) == 2 &&
-               !memcmp(tp, "su", 2);
+               clean44_bytes_equal(tp, "su", 2);
     }
 }
 
