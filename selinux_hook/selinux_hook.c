@@ -137,7 +137,6 @@ struct context {
     u32 len;
     struct mls_range range;
     char *str;
-    u32 hash;
 };
 
 #ifndef POLICYDB_BOUNDS_MAXDEPTH
@@ -470,6 +469,7 @@ static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
 static u32 g_44_clean_eval_fail_count;
+static u32 g_44_clean_access_ctxdiag_count;
 static u32 g_44_clean_shadow_access_count;
 static u32 g_44_clean_shadow_context_count;
 static u32 g_internal_policy_load_depth;
@@ -1891,6 +1891,27 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
 
     if (!policydb || !scontext || !tcontext || !avd)
         return false;
+
+    if (READ_ONCE(g_44_clean_access_ctxdiag_count) <= 32) {
+        pr_info("[selinux_hook] CLEAN44 av-entry sctx=%px u=%u r=%u t=%u tctx=%px u=%u r=%u t=%u class=%hu policy_types=%u attrmap=%px\\n",
+                scontext, scontext->user, scontext->role, scontext->type,
+                tcontext, tcontext->user, tcontext->role, tcontext->type,
+                tclass, policydb->symtab[SYM_TYPES].nprim,
+                policydb->type_attr_map_array);
+    }
+
+    if (!scontext->user || scontext->user > policydb->symtab[SYM_USERS].nprim ||
+        !scontext->role || scontext->role > policydb->symtab[SYM_ROLES].nprim ||
+        !scontext->type || scontext->type > policydb->symtab[SYM_TYPES].nprim ||
+        !tcontext->user || tcontext->user > policydb->symtab[SYM_USERS].nprim ||
+        !tcontext->role || tcontext->role > policydb->symtab[SYM_ROLES].nprim ||
+        !tcontext->type || tcontext->type > policydb->symtab[SYM_TYPES].nprim) {
+        pr_warn("[selinux_hook] CLEAN44 av-invalid-context s=%u/%u/%u t=%u/%u/%u class=%hu policy_types=%u\\n",
+                scontext->user, scontext->role, scontext->type,
+                tcontext->user, tcontext->role, tcontext->type,
+                tclass, policydb->symtab[SYM_TYPES].nprim);
+        return false;
+    }
 
     avd->allowed = 0;
     avd->auditallow = 0;
@@ -3610,6 +3631,39 @@ static int clean_access_transaction(char *buf, size_t size)
 
     zero_bytes(&avd, sizeof(avd));
     zero_bytes(&xperms, sizeof(xperms));
+
+    /*
+     * 4.4 ABI diagnostic: the clean parser should hand the evaluator
+     * ordinary policy IDs.  Log the exact stack objects once per access
+     * transaction window so an ABI/layout overwrite is distinguishable
+     * from a policy lookup failure.
+     */
+    if (READ_ONCE(g_44_clean_access_ctxdiag_count) < 32) {
+        u32 n = READ_ONCE(g_44_clean_access_ctxdiag_count) + 1;
+        WRITE_ONCE(g_44_clean_access_ctxdiag_count, n);
+        pr_info("[selinux_hook] CLEAN44 access-ctx #%u sctx=%px u=%u r=%u t=%u tctx=%px u=%u r=%u t=%u class=%lu src=\"%s\" dst=\"%s\"\\n",
+                n, &sctx, sctx.user, sctx.role, sctx.type,
+                &tctx, tctx.user, tctx.role, tctx.type,
+                class_value, src, dst);
+    }
+
+    if (!sctx.user || sctx.user > policydb->symtab[SYM_USERS].nprim ||
+        !sctx.role || sctx.role > policydb->symtab[SYM_ROLES].nprim ||
+        !sctx.type || sctx.type > policydb->symtab[SYM_TYPES].nprim ||
+        !tctx.user || tctx.user > policydb->symtab[SYM_USERS].nprim ||
+        !tctx.role || tctx.role > policydb->symtab[SYM_ROLES].nprim ||
+        !tctx.type || tctx.type > policydb->symtab[SYM_TYPES].nprim) {
+        pr_warn("[selinux_hook] CLEAN44 access-ctx-invalid s_u=%u s_r=%u s_t=%u t_u=%u t_r=%u t_t=%u class=%lu policy_users=%u policy_roles=%u policy_types=%u src=\"%s\" dst=\"%s\"\\n",
+                sctx.user, sctx.role, sctx.type,
+                tctx.user, tctx.role, tctx.type,
+                class_value,
+                policydb->symtab[SYM_USERS].nprim,
+                policydb->symtab[SYM_ROLES].nprim,
+                policydb->symtab[SYM_TYPES].nprim,
+                src, dst);
+        rc = 0;
+        goto out_cleanup;
+    }
 
     rc = context_struct_compute_av_intel(policydb, &sctx, &tctx,
                                          (u16)class_value, &avd, &xperms);
