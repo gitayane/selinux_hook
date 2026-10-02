@@ -460,6 +460,7 @@ static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
 static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, loff_t *pos);
 static loff_t (*vfs_llseek_fn)(struct file *file, loff_t offset, int whence);
 static void *g_selinux_state;
+static void (*security_task_getsecid_fn)(struct task_struct *task, u32 *secid);
 
 static bool g_selinux_ready;
 static bool g_dirty_policy_seen;
@@ -926,25 +927,38 @@ struct kp_task_security_44 {
 
 static u32 current_selinux_sid_44(void)
 {
-    const struct kp_task_security_44 *tsec;
-    void *task_security;
-    long off;
+    u32 sid = 0;
 
-    if (!current)
-        return 0;
+    /*
+     * Linux 4.4 exposes security_task_getsecid(struct task_struct *, u32 *)
+     * as the LSM entry point for retrieving a task security identifier.
+     * Prefer it because KernelPatch keeps task_struct opaque and its
+     * task_struct_offset.security_offset is not populated by current KP.
+     */
+    if (security_task_getsecid_fn && current) {
+        security_task_getsecid_fn(current, &sid);
+        if (sid)
+            return sid;
+    }
 
-    off = (long)task_struct_offset.security_offset;
-    if (off < 0)
-        return 0;
+    /* Fallback for a future KP build that resolves security_offset. */
+    if (current) {
+        long off = (long)task_struct_offset.security_offset;
+        if (off >= 0) {
+            void *task_security =
+                *(void **)((uintptr_t)current + (uintptr_t)off);
+            if (task_security) {
+                const struct kp_task_security_44 *tsec =
+                    (const struct kp_task_security_44 *)task_security;
+                sid = READ_ONCE(tsec->sid);
+                if (sid)
+                    return sid;
+            }
+        }
+    }
 
-    task_security = *(void **)((uintptr_t)current + (uintptr_t)off);
-    if (!task_security)
-        return 0;
-
-    tsec = (const struct kp_task_security_44 *)task_security;
-    return READ_ONCE(tsec->sid);
+    return 0;
 }
-
 static u32 resolve_app_zygote_sid_44(void)
 {
     static const char app_zygote_ctx[] = "u:r:app_zygote:s0";
@@ -1672,6 +1686,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("selinux_status_update_seqlock"),
     SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
     SYMBOL_CACHE_ENTRY("security_setprocattr"),
+    SYMBOL_CACHE_ENTRY("security_task_getsecid"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
     SYMBOL_CACHE_ENTRY("sel_write_context"),
@@ -1907,6 +1922,7 @@ static void *lookup_name_optional_suffix(const char *base)
         return NULL;
 
     resolve_required_symbols_once();
+    log_symbol_addr("security_task_getsecid", (void *)security_task_getsecid_fn);
 
     entry = find_cached_symbol(base);
     if (entry)
@@ -5529,8 +5545,8 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
     WRITE_ONCE(g_status_read_count, n);
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%u comm=%s mode=simple_read ret=%ld sequence=%u policyload=%u\n",
                      n, (u32)a->local.data3, current_comm(), (long)a->ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD);
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12));
 }
 
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
@@ -5712,6 +5728,7 @@ static long init(const char *args, const char *event, void *__user r)
     if (selinux_49_compat_path())
         detect_apatch_manager_uid();
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
+    security_task_getsecid_fn = (void *)lookup_name_optional_suffix("security_task_getsecid");
     security_load_policy_compat_fn = (void *)security_load_policy_fn;
 
     /*
@@ -5790,6 +5807,7 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("security_read_policy", (void *)security_read_policy_fn);
     log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
+    log_symbol_addr("security_task_getsecid", (void *)security_task_getsecid_fn);
     log_symbol_addr("policydb_read", (void *)policydb_read_fn);
     log_symbol_addr("policydb_destroy", (void *)policydb_destroy_fn);
     log_symbol_addr("avtab_search_node", (void *)avtab_search_node_fn);
