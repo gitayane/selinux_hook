@@ -36,6 +36,13 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
+/* Linux 4.4 simple_transaction_argresp is an ssize_t header followed by
+ * flexible-array data, so SIMPLE_TRANSACTION_LIMIT == PAGE_SIZE - sizeof(ssize_t).
+ * The KPM build environment does not expose the internal macro from <linux/fs.h>.
+ */
+#ifndef SIMPLE_TRANSACTION_LIMIT
+#define SIMPLE_TRANSACTION_LIMIT (PAGE_SIZE - sizeof(ssize_t))
+#endif
 #define SELINUX_POLICYDB_FALLBACK_OFFSET sizeof(void *)
 #define CLEAN_POLICYDB_ALLOC_SIZE 0x4000
 #define SELINUX_LEGACY_BLOB_QUERY_MAX VERSION(4, 15, 0)
