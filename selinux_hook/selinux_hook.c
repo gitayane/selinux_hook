@@ -4170,7 +4170,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
             u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
 
             WRITE_ONCE(g_44_clean_shadow_context_count, n);
-            pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query="%s"\n",
+            pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query=\"%s\"\n",
                     n, uid, current_comm(), clean_rc, clean_sid, sample);
         }
         return;
