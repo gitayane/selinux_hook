@@ -1,4 +1,4 @@
-SELINUX_VERSION := 1.1.11-shadow44
+SELINUX_VERSION := 1.1.12-shadow44-access
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch
