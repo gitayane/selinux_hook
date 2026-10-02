@@ -41,7 +41,12 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
  * The KPM build environment does not expose the internal macro from <linux/fs.h>.
  */
 #ifndef SIMPLE_TRANSACTION_LIMIT
-#define SIMPLE_TRANSACTION_LIMIT (PAGE_SIZE - sizeof(ssize_t))
+/*
+ * The target is Linux 4.4 arm64, where PAGE_SIZE is 4096.  The KPM
+ * headers do not expose PAGE_SIZE, so mirror simple_transaction_argresp:
+ * PAGE_SIZE - sizeof(ssize_t).
+ */
+#define SIMPLE_TRANSACTION_LIMIT (4096U - sizeof(ssize_t))
 #endif
 #define SELINUX_POLICYDB_FALLBACK_OFFSET sizeof(void *)
 #define CLEAN_POLICYDB_ALLOC_SIZE 0x4000
