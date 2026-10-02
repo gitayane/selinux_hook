@@ -4310,6 +4310,7 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
     slot = (u32)a->local.data2;
+
     if (a->local.data3)
         leave_clean_eval_scope();
 
@@ -4319,7 +4320,6 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
 
     live_ret = (long)a->ret;
 
-    /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
         ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
@@ -4329,9 +4329,7 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
         }
     }
 
-    if (mode == 2) {
-        if (mode == 7) {
-        struct access_probe *shadow = &g_probes[slot];
+    if (mode == 7) {
         u32 live_allowed = 0;
         u32 live_auditallow = 0;
         u32 live_auditdeny = 0;
@@ -4339,38 +4337,30 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
         u32 live_flags = 0;
         int match;
 
-        if (!shadow->clean_shadow_valid)
+        if (!probe->clean_shadow_valid)
             return;
 
         if (!parse_live_access_response((const char *)a->arg1, live_ret,
-                                         &live_allowed, &live_auditallow,
-                                         &live_auditdeny, &live_seqno,
-                                         &live_flags)) {
-            pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d live-parse-failed ret=%ld query="%s"\n",
-                    id, shadow->uid, live_ret, shadow->query);
+                                        &live_allowed, &live_auditallow,
+                                        &live_auditdeny, &live_seqno,
+                                        &live_flags)) {
+            pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d live-parse-failed ret=%ld query=\"%s\"\n",
+                    id, probe->uid, live_ret, probe->query);
             return;
         }
 
-        match = shadow->clean_allowed == live_allowed &&
-                shadow->clean_auditallow == live_auditallow &&
-                shadow->clean_auditdeny == live_auditdeny;
+        match = probe->clean_allowed == live_allowed &&
+                probe->clean_auditallow == live_auditallow &&
+                probe->clean_auditdeny == live_auditdeny;
 
-        pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d allowed=%08x/%08x auditallow=%08x/%08x auditdeny=%08x/%08x seqno=%u/%u flags=%08x/%08x match=%d query="%s"\n",
-                id, shadow->uid,
-                shadow->clean_allowed, live_allowed,
-                shadow->clean_auditallow, live_auditallow,
-                shadow->clean_auditdeny, live_auditdeny,
-                shadow->clean_seqno, live_seqno,
-                shadow->clean_flags, live_flags,
-                match, shadow->query);
-        return;
-    }
-
-    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policy=%px clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
-                         probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
-                         g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
-                         READ_ONCE(g_clean_policy_blob), READ_ONCE(g_clean_policy_len),
-                         probe->query);
+        pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d allowed=%08x/%08x auditallow=%08x/%08x auditdeny=%08x/%08x seqno=%u/%u flags=%08x/%08x match=%d query=\"%s\"\n",
+                id, probe->uid,
+                probe->clean_allowed, live_allowed,
+                probe->clean_auditallow, live_auditallow,
+                probe->clean_auditdeny, live_auditdeny,
+                probe->clean_seqno, live_seqno,
+                probe->clean_flags, live_flags,
+                match, probe->query);
         return;
     }
 
