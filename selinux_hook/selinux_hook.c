@@ -4374,7 +4374,12 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
 
     live_ret = (long)a->ret;
 
-    if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
+    /*
+     * Shadow mode (mode 7) must remain observational.  In particular, do not
+     * rewrite the live /sys/fs/selinux/access response before comparing it.
+     * Older modes may still normalize the response sequence number.
+     */
+    if (mode != 7 && live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
         ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
         if (new_ret > 0) {
