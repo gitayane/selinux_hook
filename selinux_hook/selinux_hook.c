@@ -4008,16 +4008,15 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
             g_probes[slot].clean_seqno = clean.seqno;
             g_probes[slot].clean_flags = clean.flags;
 
-            a->local.data0 = clean.parsed ? 7 : 0;
-            a->local.data1 = n;
-            a->local.data2 = slot;
-
             if (clean.parsed) {
-                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query="%s"\n",
+                a->local.data0 = 7;
+                a->local.data1 = n;
+                a->local.data2 = slot;
+                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query=\"%s\"\n",
                         n, uid, current_comm(), clean.allowed, clean.auditallow,
                         clean.auditdeny, clean.seqno, clean.flags, sample);
             } else {
-                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query="%s"\n",
+                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query=\"%s\"\n",
                         n, uid, current_comm(), sample);
             }
         }
