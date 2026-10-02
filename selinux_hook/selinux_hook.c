@@ -3676,12 +3676,19 @@ static int clean_access_transaction(char *buf, size_t size)
                                    sctx.type - 1)
                   ? AVD_FLAGS_PERMISSIVE : 0;
 
-    rc = scnprintf(buf, size, "%x %x %x %x %u %x",
+    /*
+     * sel_write_access() writes the response into the transaction buffer with
+     * SIMPLE_TRANSACTION_LIMIT, not the input write length.  The input query
+     * can be shorter than the fixed-width AV decision response (for example
+     * shell -> su), so using \"size\" here spuriously reported evaluator-
+     * unavailable whenever the response did not fit in the input length.
+     */
+    rc = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x",
                    avd.allowed, 0xffffffffU,
                    avd.auditallow, avd.auditdeny,
                    avd.seqno, avd.flags);
 
-    if (rc <= 0 || (size_t)rc >= size)
+    if (rc <= 0 || rc >= SIMPLE_TRANSACTION_LIMIT)
         rc = 0;
 
 out_cleanup:
