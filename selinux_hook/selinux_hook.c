@@ -505,6 +505,7 @@ struct clean_access_shadow_result {
     u32 seqno;
     u32 flags;
     int parsed;
+    int state; /* 1=clean decision, -1=clean context invalid, 0=unavailable */
 };
 
 struct access_probe {
@@ -3518,17 +3519,21 @@ static int clean_access_transaction_shadow(const char *buf, size_t size,
     tmp[size] = '\0';
 
     rc = clean_access_transaction(tmp, size);
-    if (rc > 0 && out) {
+    if (out) {
         allowed = ignored = auditallow = auditdeny = seqno = flags = 0;
-        if (sscanf(tmp, "%x %x %x %x %u %x",
-                   &allowed, &ignored, &auditallow, &auditdeny,
-                   &seqno, &flags) == 6) {
+        if (rc > 0 && sscanf(tmp, "%x %x %x %x %u %x",
+                             &allowed, &ignored, &auditallow, &auditdeny,
+                             &seqno, &flags) == 6) {
             out->allowed = allowed;
             out->auditallow = auditallow;
             out->auditdeny = auditdeny;
             out->seqno = seqno;
             out->flags = flags;
             out->parsed = 1;
+            out->state = 1;
+        } else if (rc == -EINVAL) {
+            /* A context is absent/invalid in the captured clean policy. */
+            out->state = -1;
         }
     }
 
@@ -4056,21 +4061,19 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     }
     if (selinux_44_compat_path()) {
         /*
-         * Linux 4.4 has no compatible clean-policy argument redirection path,
-         * so keep the real evaluator untouched.  We still compute a clean
-         * shadow decision, compare it after the original handler returns, and
-         * then apply the narrowly-scoped DirtySepolicy filter to app-side
-         * probes only.
+         * Linux 4.4 cannot safely redirect the global context_struct_compute_av()
+         * policy argument without changing the live SELinux policy seen by other
+         * threads.  Therefore this path evaluates the request independently
+         * against the captured clean policydb, then lets the real live evaluator
+         * run for comparison.  Afterward the generic clean result is returned to
+         * the unprivileged caller.
          *
-         * data3:
-         *   0 = observational only
-         *   1 = return EINVAL for a known DirtySepolicy access probe
-         *   2 = rewrite only the DirtySepolicy avd-seqno probe to seqno=1
+         * There are no DirtySepolicy-specific query strings here.  Any request
+         * that can be evaluated from the clean policy is treated according to
+         * that policy; requests whose contexts are absent from it get EINVAL.
          */
-        if (uid >= 10000 &&
-            READ_ONCE(g_44_clean_shadow_access_count) < 64) {
+        if (uid >= 10000) {
             struct clean_access_shadow_result clean;
-            u32 n;
 
             zero_bytes(&clean, sizeof(clean));
             clean_access_transaction_shadow((const char *)a->arg1, size, &clean);
@@ -4095,15 +4098,27 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
             a->local.data2 = slot;
 
             if (clean.parsed) {
-                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query=\"%s\"\n",
-                        n, uid, current_comm(), clean.allowed, clean.auditallow,
-                        clean.auditdeny, clean.seqno, clean.flags, sample);
+                if (n <= 64)
+                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query=\"%s\"\n",
+                            n, uid, current_comm(), clean.allowed, clean.auditallow,
+                            clean.auditdeny, clean.seqno, clean.flags, sample);
+            } else if (clean.state < 0) {
+                if (n <= 64)
+                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s clean-context-invalid query=\"%s\"\n",
+                            n, uid, current_comm(), sample);
+                a->skip_origin = 1;
+                a->ret = (uint64_t)-EINVAL;
+                return;
             } else {
-                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query=\"%s\"\n",
-                        n, uid, current_comm(), sample);
+                if (n <= 64)
+                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query=\"%s\"\n",
+                            n, uid, current_comm(), sample);
             }
+        }
+        return;
+    }
 
-            if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
+    if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
                 a->local.data3 = 2;
             } else if (dirtysepolicy_access_should_deny(sample, sample_len)) {
                 a->local.data3 = 1;
@@ -4252,49 +4267,33 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         return;
     }
     if (selinux_44_compat_path()) {
+        /*
+         * Reproduce the clean policy's context validation generically.  This
+         * intentionally does not identify DirtySepolicy or any particular
+         * detector context.
+         */
         if (uid >= 10000) {
-            if (READ_ONCE(g_44_clean_shadow_context_count) < 64) {
-                u32 clean_sid = SECSID_NULL;
-                int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
-                u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
+            u32 clean_sid = SECSID_NULL;
+            int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
+            u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
 
-                WRITE_ONCE(g_44_clean_shadow_context_count, n);
-                pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query=\"%s\"\n",
-                        n, uid, current_comm(), clean_rc, clean_sid, sample);
-            }
+            WRITE_ONCE(g_44_clean_shadow_context_count, n);
 
-            /*
-             * contextExists() first probes /context.  On a 4.4 kernel the
-             * shadow evaluator is observational, but the public detection
-             * contract requires invalid-context semantics for known dirty
-             * labels.  Keep the filter narrowly scoped to the documented
-             * DirtySepolicy context set.
-             */
-            if (dirtysepolicy_context_should_hide(sample)) {
-                pr_info("[selinux_hook] CLEAN44 context-filter uid=%d comm=%s ret=-EINVAL query=\"%s\"\n",
-                        uid, current_comm(), sample);
+            if (clean_rc == 0) {
+                if (n <= 64)
+                    pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=0 clean_sid=%u query=\"%s\"\n",
+                            n, uid, current_comm(), clean_sid, sample);
+            } else if (clean_rc == -EINVAL) {
+                if (n <= 64)
+                    pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=-EINVAL query=\"%s\"\n",
+                            n, uid, current_comm(), sample);
                 a->skip_origin = 1;
-                a->ret = -EINVAL;
+                a->ret = (uint64_t)-EINVAL;
+            } else if (n <= 64) {
+                pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s evaluator-unavailable ret=%d query=\"%s\"\n",
+                        n, uid, current_comm(), clean_rc, sample);
             }
         }
-        return;
-    }
-
-    if (dirtysepolicy_context_should_hide(sample)) {
-        n = READ_ONCE(g_clean_access_count) + 1;
-        WRITE_ONCE(g_clean_access_count, n);
-        a->local.data0 = 4;
-        a->local.data1 = n;
-        slot = n & (ACCESS_PROBE_SLOTS - 1);
-        a->local.data2 = slot;
-        g_probes[slot].id = n;
-        g_probes[slot].uid = uid;
-        g_probes[slot].node = "context";
-        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-        pr_info("[selinux_hook] DIRTYSEPOLICY hide /sys/fs/selinux/context #%u uid=%d comm=%s query=\"%s\"\n",
-                n, uid, current_comm(), sample);
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
         return;
     }
 
@@ -4450,9 +4449,9 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
             return;
 
         if (!parse_live_access_response((const char *)a->arg1, live_ret,
-                                        &live_allowed, &live_auditallow,
-                                        &live_auditdeny, &live_seqno,
-                                        &live_flags)) {
+                                         &live_allowed, &live_auditallow,
+                                         &live_auditdeny, &live_seqno,
+                                         &live_flags)) {
             pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d live-parse-failed ret=%ld query=\"%s\"\n",
                     id, probe->uid, live_ret, probe->query);
             return;
@@ -4472,25 +4471,27 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
                 match, probe->query);
 
         /*
-         * Apply only after the observational comparison.  This leaves the
-         * original live evaluator untouched for ordinary callers while making
-         * the known DirtySepolicy probes indistinguishable from a clean device.
+         * Policy-driven application: expose the clean evaluator's complete
+         * av_decision to userspace, regardless of which program generated the
+         * request.  The live evaluator was not modified; only this selinuxfs
+         * transaction response is replaced.
          */
-        if (a->local.data3 == 1) {
-            a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN44 access-filter #%u uid=%d mode=EINVAL query=\"%s\"\n",
-                    id, probe->uid, probe->query);
-        } else if (a->local.data3 == 2) {
-            long ret = write_clean_access_seqno_response((char *)a->arg1,
-                                                         (size_t)a->arg2);
-            if (ret > 0) {
-                a->ret = (uint64_t)ret;
-                pr_info("[selinux_hook] CLEAN44 access-filter #%u uid=%d mode=seqno ret=%ld query=\"%s\"\n",
-                        id, probe->uid, ret, probe->query);
+        {
+            long clean_ret = scnprintf((char *)a->arg1, SIMPLE_TRANSACTION_LIMIT,
+                                       "%x %x %x %x %u %x",
+                                       probe->clean_allowed, 0xffffffffU,
+                                       probe->clean_auditallow,
+                                       probe->clean_auditdeny,
+                                       probe->clean_seqno,
+                                       probe->clean_flags);
+            if (clean_ret > 0 && clean_ret < SIMPLE_TRANSACTION_LIMIT) {
+                a->ret = (uint64_t)clean_ret;
+                if (id <= 64)
+                    pr_info("[selinux_hook] CLEAN44 access-apply #%u uid=%d ret=%ld query=\"%s\"\n",
+                            id, probe->uid, clean_ret, probe->query);
             } else {
-                a->ret = (uint64_t)-EINVAL;
-                pr_info("[selinux_hook] CLEAN44 access-filter #%u uid=%d mode=seqno-fallback-EINVAL query=\"%s\"\n",
-                        id, probe->uid, probe->query);
+                pr_warn("[selinux_hook] CLEAN44 access-apply #%u uid=%d failed ret=%ld query=\"%s\"\n",
+                        id, probe->uid, clean_ret, probe->query);
             }
         }
         return;
