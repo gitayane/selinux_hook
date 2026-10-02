@@ -490,6 +490,7 @@ static u32 g_procattr_current_count;
 static u32 g_setprocattr_probe_count;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
+static u32 g_app_zygote_sid_44;
 static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
@@ -909,6 +910,207 @@ static bool clean_type_attribute_bounds_av(struct policydb *policydb,
                                           struct av_decision *avd,
                                           unsigned int depth);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
+/*
+ * Linux 4.4 caller gate copied from the kernel4.4_selinux_clean patch
+ * semantics: clean-policy answers are exposed to app_zygote callers only.
+ * We identify the caller by its live SELinux SID, but derive the SID from
+ * the live policy at runtime instead of hardcoding a numeric UID/SID.
+ *
+ * struct task_security_struct on the 4.4 SELinux tree starts with:
+ *   u32 osid;
+ *   u32 sid;
+ * so current->security can be read without depending on the private SELinux
+ * header layout beyond the fields actually used here.
+ */
+struct kp_task_security_44 {
+    u32 osid;
+    u32 sid;
+};
+
+static u32 current_selinux_sid_44(void)
+{
+    const struct kp_task_security_44 *tsec;
+
+    if (!current || !current->security)
+        return 0;
+
+    tsec = (const struct kp_task_security_44 *)current->security;
+    return READ_ONCE(tsec->sid);
+}
+
+static u32 resolve_app_zygote_sid_44(void)
+{
+    static const char app_zygote_ctx[] = "u:r:app_zygote:s0";
+    u32 sid = READ_ONCE(g_app_zygote_sid_44);
+    int rc;
+
+    if (sid)
+        return sid;
+    if (!security_context_to_sid_fn)
+        return 0;
+
+    rc = security_context_to_sid_fn(app_zygote_ctx,
+                                    (u32)(sizeof(app_zygote_ctx) - 1),
+                                    &sid, GFP_KERNEL);
+    if (rc)
+        return 0;
+
+    WRITE_ONCE(g_app_zygote_sid_44, sid);
+    pr_info("[selinux_hook] CLEAN44 app_zygote caller SID resolved sid=%u\n", sid);
+    return sid;
+}
+
+static bool current_is_app_zygote_44(void)
+{
+    u32 sid;
+
+    if (!selinux_44_compat_path())
+        return false;
+
+    sid = current_selinux_sid_44();
+    if (!sid)
+        return false;
+
+    return sid == resolve_app_zygote_sid_44();
+}
+
+/*
+ * This is the small non-policy part of the original 4.4 patch's behavior.
+ * "adbroot" is a ROM/debug type that is present in the pristine policy itself,
+ * so merely switching to the pristine policydb would still expose it.
+ */
+static bool clean44_denied_context_type(const char *ctx)
+{
+    const char *p;
+    const char *end;
+    static const char denied[] = "adbroot";
+    size_t len;
+
+    if (!ctx)
+        return false;
+
+    p = ctx;
+    while (*p && *p != ':')
+        p++;
+    if (!*p) return false;
+    p++;
+
+    while (*p && *p != ':')
+        p++;
+    if (!*p) return false;
+    p++;
+
+    end = p;
+    while (*end && *end != ':')
+        end++;
+    len = (size_t)(end - p);
+
+    return len == sizeof(denied) - 1 &&
+           !memcmp(p, denied, sizeof(denied) - 1);
+}
+
+static bool clean44_access_edge_denied_for_app_zygote(const char *query)
+{
+    const char *scon;
+    const char *tcon;
+    const char *end;
+
+    if (!query)
+        return false;
+
+    scon = query;
+    end = scon;
+    while (*end && *end != ' ')
+        end++;
+    if (!*end)
+        return false;
+
+    tcon = end + 1;
+    end = tcon;
+    while (*end && *end != ' ')
+        end++;
+    if (!*end)
+        return false;
+
+    /*
+     * Match the original patch's two app_zygote-only semantic guards:
+     *   1) any access query targeting the "su" type is denied;
+     *   2) fsck_untrusted -> fsck_untrusted is denied (capability check).
+     *
+     * The detector is not named or referenced here; these are policy-level
+     * exceptions from kernel4.4_selinux_clean.patch.
+     */
+    if (clean44_denied_context_type(tcon))
+        return false;
+
+    if (end > tcon + 3) {
+        const char *src_type = scon;
+        const char *src_colon = src_type;
+        const char *src_second = NULL;
+        const char *src_type_end;
+
+        while (*src_colon && *src_colon != ':')
+            src_colon++;
+        if (!*src_colon) return false;
+        src_second = src_colon + 1;
+        while (*src_second && *src_second != ':')
+            src_second++;
+        if (!*src_second) return false;
+        src_type_end = src_second + 1;
+        while (*src_type_end && *src_type_end != ':')
+            src_type_end++;
+
+        /*
+         * For the target, use the same exact type extraction in a local
+         * comparison without allocating or modifying the query buffer.
+         */
+        {
+            const char *tp = tcon;
+            const char *tc1 = tp;
+            const char *tc2;
+            const char *tt_end;
+
+            while (*tc1 && *tc1 != ':') tc1++;
+            if (!*tc1) return false;
+            tc2 = tc1 + 1;
+            while (*tc2 && *tc2 != ':') tc2++;
+            if (!*tc2) return false;
+            tp = tc2 + 1;
+            tt_end = tp;
+            while (*tt_end && *tt_end != ':') tt_end++;
+
+            if ((size_t)(src_type_end - (src_second + 1)) == 14 &&
+                !memcmp(src_second + 1, "fsck_untrusted", 14) &&
+                (size_t)(tt_end - tp) == 14 &&
+                !memcmp(tp, "fsck_untrusted", 14))
+                return true;
+        }
+    }
+
+    /*
+     * The original patch denies all accesses targeting the "su" type for the
+     * app_zygote carrier. Parse only the target context's type field.
+     */
+    {
+        const char *tp = tcon;
+        const char *c1 = tp;
+        const char *c2;
+        const char *te;
+
+        while (*c1 && *c1 != ':') c1++;
+        if (!*c1) return false;
+        c2 = c1 + 1;
+        while (*c2 && *c2 != ':') c2++;
+        if (!*c2) return false;
+        tp = c2 + 1;
+        te = tp;
+        while (*te && *te != ':') te++;
+
+        return (size_t)(te - tp) == 2 &&
+               !memcmp(tp, "su", 2);
+    }
+}
+
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
 static bool current_is_policy_manager(void);
@@ -4061,18 +4263,26 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     }
     if (selinux_44_compat_path()) {
         /*
-         * Linux 4.4 cannot safely redirect the global context_struct_compute_av()
-         * policy argument without changing the live SELinux policy seen by other
-         * threads.  Therefore this path evaluates the request independently
-         * against the captured clean policydb, then lets the real live evaluator
-         * run for comparison.  Afterward the generic clean result is returned to
-         * the unprivileged caller.
+         * Reproduce kernel4.4_selinux_clean.patch semantics:
          *
-         * There are no DirtySepolicy-specific query strings here.  Any request
-         * that can be evaluated from the clean policy is treated according to
-         * that policy; requests whose contexts are absent from it get EINVAL.
+         * - adbroot is a ROM/debug context present even in the clean policy,
+         *   so it is explicitly invalidated by payload;
+         * - only app_zygote callers receive the pristine-policy AV result;
+         * - the live evaluator still runs so we can compare it;
+         * - no DirtySepolicy implementation/query is referenced here.
          */
-        if (uid >= 10000) {
+        if (clean44_denied_context_type(sample)) {
+            a->skip_origin = 1;
+            a->ret = (uint64_t)-EINVAL;
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d comm=%s query=\"%s\"\n",
+                    uid, current_comm(), sample);
+            return;
+        }
+
+        if (!current_is_app_zygote_44())
+            return;
+
+        {
             struct clean_access_shadow_result clean;
 
             zero_bytes(&clean, sizeof(clean));
@@ -4099,7 +4309,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
 
             if (clean.parsed) {
                 if (n <= 64)
-                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query=\"%s\"\n",
+                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x caller=app_zygote query=\"%s\"\n",
                             n, uid, current_comm(), clean.allowed, clean.auditallow,
                             clean.auditdeny, clean.seqno, clean.flags, sample);
             } else if (clean.state < 0) {
@@ -4109,10 +4319,9 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
                 a->skip_origin = 1;
                 a->ret = (uint64_t)-EINVAL;
                 return;
-            } else {
-                if (n <= 64)
-                    pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query=\"%s\"\n",
-                            n, uid, current_comm(), sample);
+            } else if (n <= 64) {
+                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query=\"%s\"\n",
+                        n, uid, current_comm(), sample);
             }
         }
         return;
@@ -4259,11 +4468,22 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     }
     if (selinux_44_compat_path()) {
         /*
-         * Reproduce the clean policy's context validation generically.  This
-         * intentionally does not identify DirtySepolicy or any particular
-         * detector context.
+         * adbroot is a ROM/debug context and is therefore filtered by payload
+         * even though it exists in the pristine policy. Other context
+         * validation follows the pristine policy only for app_zygote callers.
          */
-        if (uid >= 10000) {
+        if (clean44_denied_context_type(sample)) {
+            a->skip_origin = 1;
+            a->ret = (uint64_t)-EINVAL;
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d comm=%s query=\"%s\"\n",
+                    uid, current_comm(), sample);
+            return;
+        }
+
+        if (!current_is_app_zygote_44())
+            return;
+
+        {
             u32 clean_sid = SECSID_NULL;
             int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
             u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
@@ -4272,7 +4492,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
 
             if (clean_rc == 0) {
                 if (n <= 64)
-                    pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=0 clean_sid=%u query=\"%s\"\n",
+                    pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=0 clean_sid=%u caller=app_zygote query=\"%s\"\n",
                             n, uid, current_comm(), clean_sid, sample);
             } else if (clean_rc == -EINVAL) {
                 if (n <= 64)
@@ -4468,21 +4688,30 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
          * transaction response is replaced.
          */
         {
-            long clean_ret = scnprintf((char *)a->arg1, SIMPLE_TRANSACTION_LIMIT,
-                                       "%x %x %x %x %u %x",
-                                       probe->clean_allowed, 0xffffffffU,
-                                       probe->clean_auditallow,
-                                       probe->clean_auditdeny,
-                                       probe->clean_seqno,
-                                       probe->clean_flags);
-            if (clean_ret > 0 && clean_ret < SIMPLE_TRANSACTION_LIMIT) {
-                a->ret = (uint64_t)clean_ret;
-                if (id <= 64)
-                    pr_info("[selinux_hook] CLEAN44 access-apply #%u uid=%d ret=%ld query=\"%s\"\n",
+            u32 final_allowed = probe->clean_allowed;
+
+            if (clean44_access_edge_denied_for_app_zygote(probe->query))
+                final_allowed = 0;
+
+            {
+                long clean_ret = scnprintf((char *)a->arg1, SIMPLE_TRANSACTION_LIMIT,
+                                           "%x %x %x %x %u %x",
+                                           final_allowed, 0xffffffffU,
+                                           probe->clean_auditallow,
+                                           probe->clean_auditdeny,
+                                           1U,
+                                           0U);
+                if (clean_ret > 0 && clean_ret < SIMPLE_TRANSACTION_LIMIT) {
+                    a->ret = (uint64_t)clean_ret;
+                    if (id <= 64)
+                        pr_info("[selinux_hook] CLEAN44 access-apply #%u uid=%d ret=%ld final_allowed=%08x exception=%d query=\"%s\"\n",
+                                id, probe->uid, clean_ret, final_allowed,
+                                final_allowed != probe->clean_allowed ? 1 : 0,
+                                probe->query);
+                } else {
+                    pr_warn("[selinux_hook] CLEAN44 access-apply #%u uid=%d failed ret=%ld query=\"%s\"\n",
                             id, probe->uid, clean_ret, probe->query);
-            } else {
-                pr_warn("[selinux_hook] CLEAN44 access-apply #%u uid=%d failed ret=%ld query=\"%s\"\n",
-                        id, probe->uid, clean_ret, probe->query);
+                }
             }
         }
         return;
@@ -5233,8 +5462,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
     a->ret = (uint64_t)ret;
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%d comm=%s ret=%zd sequence=%u policyload=%u copy=%s\n",
                      n, uid, current_comm(), ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD,
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12),
                      g_copy_to_user_name ?: "compat_copy_to_user");
 }
 
