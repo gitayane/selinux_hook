@@ -4119,15 +4119,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     }
 
     if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
-                a->local.data3 = 2;
-            } else if (dirtysepolicy_access_should_deny(sample, sample_len)) {
-                a->local.data3 = 1;
-            }
-        }
-        return;
-    }
-
-    if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
         long ret;
 
         n = READ_ONCE(g_clean_access_count) + 1;
