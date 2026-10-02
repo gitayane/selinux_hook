@@ -490,6 +490,12 @@ struct access_probe {
     uid_t uid;
     const char *node;
     char query[ACCESS_SAMPLE_MAX];
+    u32 clean_allowed;
+    u32 clean_auditallow;
+    u32 clean_auditdeny;
+    u32 clean_seqno;
+    u32 clean_flags;
+    bool clean_shadow_valid;
 };
 
 struct clean_eval_scope {
@@ -3444,19 +3450,46 @@ out:
     return rc;
 }
 
-static int clean_access_transaction_shadow(const char *buf, size_t size)
+static int clean_access_transaction_shadow(const char *buf, size_t size,
+                                             struct clean_access_shadow_result *out)
 {
     char *tmp;
     int rc;
+    unsigned int allowed;
+    unsigned int ignored;
+    unsigned int auditallow;
+    unsigned int auditdeny;
+    unsigned int seqno;
+    unsigned int flags;
+
+    if (out)
+        zero_bytes(out, sizeof(*out));
 
     if (!buf || !size || !vmalloc_fn || !vfree_fn)
         return 0;
+
     tmp = (char *)vmalloc_fn((unsigned long)(size + 1));
     if (!tmp)
         return 0;
+
     copy_bytes(tmp, buf, size);
     tmp[size] = '\0';
+
     rc = clean_access_transaction(tmp, size);
+    if (rc > 0 && out) {
+        allowed = ignored = auditallow = auditdeny = seqno = flags = 0;
+        if (sscanf(tmp, "%x %x %x %x %u %x",
+                   &allowed, &ignored, &auditallow, &auditdeny,
+                   &seqno, &flags) == 6) {
+            out->allowed = allowed;
+            out->auditallow = auditallow;
+            out->auditdeny = auditdeny;
+            out->seqno = seqno;
+            out->flags = flags;
+            out->parsed = 1;
+        }
+    }
+
     vfree_fn(tmp);
     return rc;
 }
@@ -3938,22 +3971,50 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
             log_bypass_once("access", uid, sample);
         return;
     }
-    /* 4.4 shadow evaluation: never modify or reject the live SELinux transaction. */
-    if (selinux_44_compat_path() && uid >= 10000 &&
-        READ_ONCE(g_44_clean_shadow_access_count) < 64) {
-        int clean_rc = clean_access_transaction_shadow((const char *)a->arg1, size);
-        u32 n = READ_ONCE(g_44_clean_shadow_access_count) + 1;
-        WRITE_ONCE(g_44_clean_shadow_access_count, n);
-        pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s clean_ret=%d query=\"%s\"\n",
-                n, uid, current_comm(), clean_rc, sample);
+    if (selinux_44_compat_path()) {
+        /*
+         * Shadow-only on 4.4: compute the clean AV decision and compare it
+         * with the live transaction after the original handler returns.
+         */
+        if (uid >= 10000 &&
+            READ_ONCE(g_44_clean_shadow_access_count) < 64) {
+            struct clean_access_shadow_result clean;
+            u32 n;
+
+            zero_bytes(&clean, sizeof(clean));
+            clean_access_transaction_shadow((const char *)a->arg1, size, &clean);
+
+            n = READ_ONCE(g_44_clean_shadow_access_count) + 1;
+            WRITE_ONCE(g_44_clean_shadow_access_count, n);
+
+            slot = n & (ACCESS_PROBE_SLOTS - 1);
+            g_probes[slot].id = n;
+            g_probes[slot].uid = uid;
+            g_probes[slot].node = "access-shadow";
+            copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+            g_probes[slot].clean_shadow_valid = clean.parsed;
+            g_probes[slot].clean_allowed = clean.allowed;
+            g_probes[slot].clean_auditallow = clean.auditallow;
+            g_probes[slot].clean_auditdeny = clean.auditdeny;
+            g_probes[slot].clean_seqno = clean.seqno;
+            g_probes[slot].clean_flags = clean.flags;
+
+            a->local.data0 = clean.parsed ? 7 : 0;
+            a->local.data1 = n;
+            a->local.data2 = slot;
+
+            if (clean.parsed) {
+                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s allowed=%08x auditallow=%08x auditdeny=%08x seqno=%u flags=%08x query="%s"\n",
+                        n, uid, current_comm(), clean.allowed, clean.auditallow,
+                        clean.auditdeny, clean.seqno, clean.flags, sample);
+            } else {
+                pr_info("[selinux_hook] CLEAN44 access-shadow #%u uid=%d comm=%s evaluator-unavailable query="%s"\n",
+                        n, uid, current_comm(), sample);
+            }
+        }
+        return;
     }
 
-    return;
-    /*
-     * If clean-policy evaluation is unavailable on the 4.4 target, preserve
-     * the origin query rather than falling back to detector-specific rules.
-     */
-    return;
     if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
         long ret;
 
@@ -4093,23 +4154,19 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
             log_bypass_once("context", uid, sample);
         return;
     }
-    /* 4.4 shadow evaluation: never modify or reject the live SELinux transaction. */
-    if (selinux_44_compat_path() && uid >= 10000 &&
-        READ_ONCE(g_44_clean_shadow_context_count) < 64) {
-        u32 clean_sid = SECSID_NULL;
-        int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
-        u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
-        WRITE_ONCE(g_44_clean_shadow_context_count, n);
-        pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query=\"%s\"\n",
-                n, uid, current_comm(), clean_rc, clean_sid, sample);
-    }
+    if (selinux_44_compat_path()) {
+        if (uid >= 10000 &&
+            READ_ONCE(g_44_clean_shadow_context_count) < 64) {
+            u32 clean_sid = SECSID_NULL;
+            int clean_rc = clean_policy_context_to_sid(query, &clean_sid);
+            u32 n = READ_ONCE(g_44_clean_shadow_context_count) + 1;
 
-    return;
-    /*
-     * Evaluator unavailable: do not fall back to detector-specific context
-     * names on the 4.4 target.
-     */
-    return;
+            WRITE_ONCE(g_44_clean_shadow_context_count, n);
+            pr_info("[selinux_hook] CLEAN44 context-shadow #%u uid=%d comm=%s clean_ret=%d clean_sid=%u query="%s"\n",
+                    n, uid, current_comm(), clean_rc, clean_sid, sample);
+        }
+        return;
+    }
 
     if (dirtysepolicy_context_should_hide(sample)) {
         n = READ_ONCE(g_clean_access_count) + 1;
@@ -4190,6 +4247,47 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     }
 }
 
+static int parse_live_access_response(const char *buf, ssize_t len,
+                                      u32 *allowed, u32 *auditallow,
+                                      u32 *auditdeny, u32 *seqno, u32 *flags)
+{
+    char tmp[96];
+    size_t n;
+    unsigned int ignored;
+    unsigned int a;
+    unsigned int aa;
+    unsigned int ad;
+    unsigned int sq;
+    unsigned int fl;
+
+    if (!buf || len <= 0)
+        return 0;
+
+    n = (size_t)len;
+    if (n >= sizeof(tmp))
+        n = sizeof(tmp) - 1;
+
+    copy_bytes(tmp, buf, n);
+    tmp[n] = '\0';
+
+    a = aa = ad = sq = fl = ignored = 0;
+    if (sscanf(tmp, "%x %x %x %x %u %x",
+               &a, &ignored, &aa, &ad, &sq, &fl) != 6)
+        return 0;
+
+    if (allowed)
+        *allowed = a;
+    if (auditallow)
+        *auditallow = aa;
+    if (auditdeny)
+        *auditdeny = ad;
+    if (seqno)
+        *seqno = sq;
+    if (flags)
+        *flags = fl;
+    return 1;
+}
+
 static void after_sel_write_common(hook_fargs4_t *a, void *u)
 {
     long live_ret;
@@ -4224,7 +4322,43 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     }
 
     if (mode == 2) {
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policy=%px clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+        if (mode == 7) {
+        struct access_probe *shadow = &g_probes[slot];
+        u32 live_allowed = 0;
+        u32 live_auditallow = 0;
+        u32 live_auditdeny = 0;
+        u32 live_seqno = 0;
+        u32 live_flags = 0;
+        int match;
+
+        if (!shadow->clean_shadow_valid)
+            return;
+
+        if (!parse_live_access_response((const char *)a->arg1, live_ret,
+                                         &live_allowed, &live_auditallow,
+                                         &live_auditdeny, &live_seqno,
+                                         &live_flags)) {
+            pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d live-parse-failed ret=%ld query="%s"\n",
+                    id, shadow->uid, live_ret, shadow->query);
+            return;
+        }
+
+        match = shadow->clean_allowed == live_allowed &&
+                shadow->clean_auditallow == live_auditallow &&
+                shadow->clean_auditdeny == live_auditdeny;
+
+        pr_info("[selinux_hook] CLEAN44 access-compare #%u uid=%d allowed=%08x/%08x auditallow=%08x/%08x auditdeny=%08x/%08x seqno=%u/%u flags=%08x/%08x match=%d query="%s"\n",
+                id, shadow->uid,
+                shadow->clean_allowed, live_allowed,
+                shadow->clean_auditallow, live_auditallow,
+                shadow->clean_auditdeny, live_auditdeny,
+                shadow->clean_seqno, live_seqno,
+                shadow->clean_flags, live_flags,
+                match, shadow->query);
+        return;
+    }
+
+    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policy=%px clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
                          probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
                          g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
                          READ_ONCE(g_clean_policy_blob), READ_ONCE(g_clean_policy_len),
