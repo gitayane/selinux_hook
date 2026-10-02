@@ -485,6 +485,15 @@ static bool g_simple_read_from_buffer_hooked;
 static bool g_security_load_policy_hooked;
 static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
+struct clean_access_shadow_result {
+    u32 allowed;
+    u32 auditallow;
+    u32 auditdeny;
+    u32 seqno;
+    u32 flags;
+    int parsed;
+};
+
 struct access_probe {
     u32 id;
     uid_t uid;
