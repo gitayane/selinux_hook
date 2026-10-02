@@ -414,6 +414,7 @@ struct policydb {
 static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
 static void (*policydb_destroy_fn)(struct policydb *policydb);
 static void *(*flex_array_get_fn)(struct flex_array *fa, unsigned int element_nr);
+static void *(*flex_array_get_ptr_fn)(struct flex_array *fa, unsigned int element_nr);
 static struct avtab_node *(*avtab_search_node_fn)(struct avtab *h, struct avtab_key *key);
 static struct avtab_node *(*avtab_search_node_next_fn)(struct avtab_node *node, int specified);
 static void (*cond_compute_av_fn)(struct avtab *ctab, struct avtab_key *key,
@@ -813,73 +814,71 @@ static bool clean_type_attribute_bounds_av(struct policydb *policydb,
                                            struct av_decision *avd,
                                            unsigned int depth)
 {
+    struct context lo_scontext;
+    struct context lo_tcontext;
+    struct context *tcontextp = tcontext;
+    struct av_decision lo_avd;
     struct type_datum *source;
     struct type_datum *target;
-    struct av_decision lower;
-    struct context lower_scontext;
-    struct context lower_tcontext;
-    u32 masked = 0;
+    u32 masked;
 
     if (!policydb || !scontext || !tcontext || !avd ||
-        !policydb->type_val_to_struct_array || !flex_array_get_fn)
+        !policydb->type_val_to_struct_array || !flex_array_get_ptr_fn)
         return false;
 
     if (depth > POLICYDB_BOUNDS_MAXDEPTH)
         return false;
 
-    source = (struct type_datum *)flex_array_get_fn(
+    /*
+     * Exact Linux 4.4 semantics: type_val_to_struct_array stores
+     * struct type_datum * entries, so it must be read with flex_array_get_ptr,
+     * not flex_array_get. Using flex_array_get here returns the slot address
+     * itself and makes source->bounds read unrelated memory (observed as
+     * 0xffffffe0 in the XZ Premium shadow trace).
+     */
+    source = (struct type_datum *)flex_array_get_ptr_fn(
         policydb->type_val_to_struct_array, scontext->type - 1);
-    target = (struct type_datum *)flex_array_get_fn(
-        policydb->type_val_to_struct_array, tcontext->type - 1);
-    if (!source || !target)
+    if (!source)
         return false;
 
-    if (source->bounds) {
-        lower_scontext = *scontext;
-        lower_scontext.type = source->bounds;
-        zero_bytes(&lower, sizeof(lower));
-        if (!context_struct_compute_av_intel(policydb, &lower_scontext,
-                                             tcontext, tclass, &lower, NULL))
-            return false;
-
-        if ((lower.allowed & avd->allowed) == avd->allowed)
-            return true;
-
-        masked = ~lower.allowed & avd->allowed;
+    if (READ_ONCE(g_44_clean_access_ctxdiag_count) <= 32) {
+        target = (struct type_datum *)flex_array_get_ptr_fn(
+            policydb->type_val_to_struct_array, tcontext->type - 1);
+        pr_info("[selinux_hook] CLEAN44 bounds source_type=%u source=%px value=%u bounds=%u primary=%u attr=%u target_type=%u target=%px target_bounds=%u\\n",
+                scontext->type, source, source->value, source->bounds,
+                source->primary, source->attribute,
+                tcontext->type, target, target ? target->bounds : 0);
     }
+
+    if (!source->bounds)
+        return true;
+
+    target = (struct type_datum *)flex_array_get_ptr_fn(
+        policydb->type_val_to_struct_array, tcontext->type - 1);
+    if (!target)
+        return false;
+
+    zero_bytes(&lo_avd, sizeof(lo_avd));
+    lo_scontext = *scontext;
+    lo_scontext.type = source->bounds;
 
     if (target->bounds) {
-        lower_tcontext = *tcontext;
-        lower_tcontext.type = target->bounds;
-        zero_bytes(&lower, sizeof(lower));
-        if (!context_struct_compute_av_intel(policydb, scontext,
-                                             &lower_tcontext, tclass,
-                                             &lower, NULL))
-            return false;
-
-        if ((lower.allowed & avd->allowed) == avd->allowed)
-            return true;
-
-        masked = ~lower.allowed & avd->allowed;
+        lo_tcontext = *tcontext;
+        lo_tcontext.type = target->bounds;
+        tcontextp = &lo_tcontext;
     }
 
-    if (source->bounds && target->bounds) {
-        zero_bytes(&lower, sizeof(lower));
-        if (!context_struct_compute_av_intel(policydb,
-                                             &lower_scontext,
-                                             &lower_tcontext,
-                                             tclass, &lower, NULL))
-            return false;
+    /* Match the real 4.4 helper: recurse once, then mask permissions that
+     * are not allowed by the lower-bound decision. */
+    if (!context_struct_compute_av_intel(policydb, &lo_scontext,
+                                         tcontextp, tclass, &lo_avd, NULL))
+        return false;
 
-        if ((lower.allowed & avd->allowed) == avd->allowed)
-            return true;
+    masked = ~lo_avd.allowed & avd->allowed;
+    if (!masked)
+        return true;
 
-        masked = ~lower.allowed & avd->allowed;
-    }
-
-    if (masked)
-        avd->allowed &= ~masked;
-
+    avd->allowed &= ~masked;
     return true;
 }
 
@@ -1412,6 +1411,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("policydb_read"),
     SYMBOL_CACHE_ENTRY("policydb_destroy"),
     SYMBOL_CACHE_ENTRY("flex_array_get"),
+    SYMBOL_CACHE_ENTRY("flex_array_get_ptr"),
     SYMBOL_CACHE_ENTRY("avtab_search_node"),
     SYMBOL_CACHE_ENTRY("avtab_search_node_next"),
     SYMBOL_CACHE_ENTRY("cond_compute_av"),
@@ -5450,6 +5450,7 @@ static long init(const char *args, const char *event, void *__user r)
         }
     }
     flex_array_get_fn = (void *)lookup_name_optional_suffix("flex_array_get");
+    flex_array_get_ptr_fn = (void *)lookup_name_optional_suffix("flex_array_get_ptr");
     avtab_search_node_fn = (void *)lookup_name_optional_suffix("avtab_search_node");
     avtab_search_node_next_fn = (void *)lookup_name_optional_suffix("avtab_search_node_next");
     cond_compute_av_fn = (void *)lookup_name_optional_suffix("cond_compute_av");
@@ -5511,9 +5512,9 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
         pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, legacy clean policydb disabled\n");
-    if (!flex_array_get_fn || !avtab_search_node_fn || !avtab_search_node_next_fn)
-        pr_warn("[selinux_hook] intel_av missing core lookup helpers flex_array_get=%px avtab_search_node=%px avtab_search_node_next=%px\n",
-                flex_array_get_fn, avtab_search_node_fn, avtab_search_node_next_fn);
+    if (!flex_array_get_fn || !flex_array_get_ptr_fn || !avtab_search_node_fn || !avtab_search_node_next_fn)
+        pr_warn("[selinux_hook] intel_av missing core lookup helpers flex_array_get=%px flex_array_get_ptr=%px avtab_search_node=%px avtab_search_node_next=%px\n",
+                flex_array_get_fn, flex_array_get_ptr_fn, avtab_search_node_fn, avtab_search_node_next_fn);
     if (!cond_compute_av_fn)
         pr_warn("[selinux_hook] intel_av cannot find cond_compute_av, conditional av rules will be skipped\n");
     if (!constraint_expr_eval_fn)
