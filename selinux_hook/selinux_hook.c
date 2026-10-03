@@ -1045,6 +1045,7 @@ static u32 resolve_app_zygote_sid_44(void)
     return sid;
 }
 
+static bool current_sid_matches_context_44(u32 sid, const char *expected);
 static u32 resolve_sepolicy_zygote_sid_44(void)
 {
     static const char sepolicy_zygote_ctx[] = "u:r:sepolicy_zygote:s0";
@@ -1084,12 +1085,19 @@ static bool current_is_app_zygote_44(void)
     sepolicy_sid = resolve_sepolicy_zygote_sid_44();
 
     /*
-     * The detector on this Android 14 build runs in sepolicy_zygote rather
+     * The detector on this Android 14 build may run in sepolicy_zygote rather
      * than app_zygote. Treat both explicitly named zygote domains as
-     * clean-shadow callers; do not match by UID or process name.
+     * clean-shadow callers; identify the domain by the task SID, not UID or
+     * process name.
+     *
+     * On this 4.4.302 tree, reverse context->SID lookup can fail transiently
+     * for sepolicy_zygote even though the task already has that SID. Fall
+     * back to the authoritative SID->context conversion in that case.
      */
     return (app_sid && sid == app_sid) ||
-           (sepolicy_sid && sid == sepolicy_sid);
+           (sepolicy_sid && sid == sepolicy_sid) ||
+           current_sid_matches_context_44(
+               sid, "u:r:sepolicy_zygote:s0");
 }
 
 /*
@@ -1109,6 +1117,45 @@ static bool clean44_bytes_equal(const char *a, const char *b, size_t len)
             return false;
     }
     return true;
+}
+
+static bool current_sid_matches_context_44(u32 sid, const char *expected)
+{
+    char *actual = NULL;
+    u32 actual_len = 0;
+    size_t expected_len;
+    int rc;
+    size_t i;
+    bool match = false;
+
+    if (!sid || !expected || !security_sid_to_context_fn || !kfree_fn)
+        return false;
+
+    expected_len = str_len_safe(expected);
+    if (!expected_len)
+        return false;
+
+    rc = security_sid_to_context_fn(sid, &actual, &actual_len);
+    if (rc || !actual)
+        return false;
+
+    if ((size_t)actual_len == expected_len) {
+        match = true;
+        for (i = 0; i < expected_len; i++) {
+            if (actual[i] != expected[i]) {
+                match = false;
+                break;
+            }
+        }
+    }
+
+    kfree_fn(actual);
+
+    if (match)
+        pr_info("[selinux_hook] CLEAN44 caller SID %u matches context %s\n",
+                sid, expected);
+
+    return match;
 }
 
 static bool clean44_denied_context_type(const char *ctx)
@@ -6081,8 +6128,19 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
      * Do not consult detector-specific context lists here.
      */
     if (selinux_44_compat_path() && !manager) {
-        clean_ret = clean_policy_context_to_sid(sample, &clean_sid);
-        clean_checked = clean_ret <= 0;
+        /*
+         * adbroot is a 4.4 policy exception: it exists in the captured
+         * pristine policy, but the original clean patch intentionally hides
+         * it. Therefore /proc/self/attr/current must return -EINVAL here too;
+         * relying solely on clean_policy_context_to_sid() leaks its SID.
+         */
+        if (clean44_denied_context_type(sample)) {
+            clean_checked = true;
+            clean_ret = -EINVAL;
+        } else {
+            clean_ret = clean_policy_context_to_sid(sample, &clean_sid);
+            clean_checked = clean_ret <= 0;
+        }
         blocked = clean_ret == -EINVAL;
 
         uid = current_uid();
