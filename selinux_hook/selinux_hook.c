@@ -549,6 +549,7 @@ static u32 g_setprocattr_probe_count;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
 static u32 g_app_zygote_sid_44;
+static u32 g_sepolicy_zygote_sid_44;
 static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
@@ -1044,9 +1045,33 @@ static u32 resolve_app_zygote_sid_44(void)
     return sid;
 }
 
+static u32 resolve_sepolicy_zygote_sid_44(void)
+{
+    static const char sepolicy_zygote_ctx[] = "u:r:sepolicy_zygote:s0";
+    u32 sid = READ_ONCE(g_sepolicy_zygote_sid_44);
+    int rc;
+
+    if (sid)
+        return sid;
+    if (!security_context_to_sid_fn)
+        return 0;
+
+    rc = security_context_to_sid_fn(sepolicy_zygote_ctx,
+                                    (u32)(sizeof(sepolicy_zygote_ctx) - 1),
+                                    &sid, (gfp_t)0xD0U);
+    if (rc)
+        return 0;
+
+    WRITE_ONCE(g_sepolicy_zygote_sid_44, sid);
+    pr_info("[selinux_hook] CLEAN44 sepolicy_zygote caller SID resolved sid=%u\n", sid);
+    return sid;
+}
+
 static bool current_is_app_zygote_44(void)
 {
     u32 sid;
+    u32 app_sid;
+    u32 sepolicy_sid;
 
     if (!selinux_44_compat_path())
         return false;
@@ -1055,7 +1080,16 @@ static bool current_is_app_zygote_44(void)
     if (!sid)
         return false;
 
-    return sid == resolve_app_zygote_sid_44();
+    app_sid = resolve_app_zygote_sid_44();
+    sepolicy_sid = resolve_sepolicy_zygote_sid_44();
+
+    /*
+     * The detector on this Android 14 build runs in sepolicy_zygote rather
+     * than app_zygote. Treat both explicitly named zygote domains as
+     * clean-shadow callers; do not match by UID or process name.
+     */
+    return (app_sid && sid == app_sid) ||
+           (sepolicy_sid && sid == sepolicy_sid);
 }
 
 /*
@@ -5317,7 +5351,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         if (clean44_denied_context_type(sample)) {
             a->skip_origin = 1;
             a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d sid=%u app_zygote=%d comm=%s query=\"%s\"\n",
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d sid=%u clean_shadow_caller=%d comm=%s query=\"%s\"\n",
                     uid, current_selinux_sid_44(), caller_is_app_zygote, current_comm(), sample);
             return;
         }
