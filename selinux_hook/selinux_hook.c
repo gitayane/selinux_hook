@@ -1100,7 +1100,7 @@ static bool current_is_app_zygote_44(void)
     return (app_sid && sid == app_sid) ||
            (sepolicy_sid && sid == sepolicy_sid) ||
            current_sid_matches_context_44(
-               sid, "u:r:sepolicy_zygote:s0");
+               sid, "u:r:app_zygote:s0");
 }
 
 /*
@@ -1157,8 +1157,19 @@ static bool current_sid_matches_context_44(u32 sid, const char *expected)
     if (rc || !actual)
         return false;
 
+    /*
+     * Maple's app_zygote SID is category-decorated (for example
+     * u:r:app_zygote:s0:c512,c768).  The raw SID therefore differs from the
+     * cached bare app_zygote SID.  Match the stable context prefix and accept
+     * an optional ':' MLS/category suffix.
+     */
     if ((size_t)actual_len == expected_len) {
         match = true;
+    } else if ((size_t)actual_len > expected_len &&
+               actual[expected_len] == ':') {
+        match = true;
+    }
+    if (match) {
         for (i = 0; i < expected_len; i++) {
             if (actual[i] != expected[i]) {
                 match = false;
