@@ -612,6 +612,7 @@ static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
 static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
+static const char *current_comm(void);
 static size_t str_len_safe(const char *s);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
 static bool dirtysepolicy_context_should_hide(const char *query);
@@ -1139,8 +1140,10 @@ static bool current_sid_matches_context_44(u32 sid, const char *expected)
 
     rc = security_sid_to_context_fn(sid, &actual, &actual_len);
 
-    /* One-shot runtime diagnostic for the SID observed on Maple 4.4.302. */
-    if (!g_sepolicy_sid_diag_done && sid == 1879) {
+    /* One-shot runtime diagnostic for the actual sepolicy_zygote task. */
+    if (!g_sepolicy_sid_diag_done &&
+        current_comm() &&
+        clean44_bytes_equal(current_comm(), "sepolicy_zygote", sizeof("sepolicy_zygote") - 1)) {
         g_sepolicy_sid_diag_done = true;
         if (rc || !actual) {
             pr_info("[selinux_hook] CLEAN44 sepolicy_zygote SID->context diag sid=%u rc=%d actual=%px len=%u\\n",
