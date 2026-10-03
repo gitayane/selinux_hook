@@ -61,12 +61,16 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define MAGISK_MOCK_POLICY_MAX_SIZE (8 * 1024 * 1024)
 #define CLEAN_EVAL_SCOPE_SLOTS 8
 #define STATUS_READ_SCOPE_SLOTS 8
-#define SEL_WRITE_OP_CREATE 1
-#define SEL_WRITE_OP_RELABEL 2
-#define SEL_WRITE_OP_USER 3
-#define SEL_WRITE_OP_MEMBER 4
+/*
+ * Linux 4.4 selinuxfs enum sel_inos starts at SEL_ROOT_INO=2:
+ * context=5, access=6, create=7, relabel=8, user=9, member=14.
+ */
 #define SEL_WRITE_OP_CONTEXT 5
 #define SEL_WRITE_OP_ACCESS 6
+#define SEL_WRITE_OP_CREATE 7
+#define SEL_WRITE_OP_RELABEL 8
+#define SEL_WRITE_OP_USER 9
+#define SEL_WRITE_OP_MEMBER 14
 
 #ifndef AVTAB_TRANSITION
 #define AVTAB_TRANSITION 0x0010
@@ -512,6 +516,7 @@ static int (*security_sid_to_context_fn)(u32 sid, char **scontext, u32 *scontext
 static int (*sidtab_context_to_sid_fn)(struct sidtab *sidtab, struct context *context, u32 *sid);
 static struct sidtab *g_sidtab;
 static void *(*kmalloc_fn)(size_t size, gfp_t flags);
+static void *(*__kmalloc_fn)(size_t size, gfp_t flags);
 static void (*kfree_fn)(const void *addr);
 
 static bool g_selinux_ready;
@@ -1804,6 +1809,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("sidtab_context_to_sid"),
     SYMBOL_CACHE_ENTRY("sidtab"),
     SYMBOL_CACHE_ENTRY("kmalloc"),
+    SYMBOL_CACHE_ENTRY("__kmalloc"),
     SYMBOL_CACHE_ENTRY("kfree"),
     SYMBOL_CACHE_ENTRY("policydb_read"),
     SYMBOL_CACHE_ENTRY("policydb_destroy"),
@@ -6649,6 +6655,9 @@ static long init(const char *args, const char *event, void *__user r)
     sidtab_context_to_sid_fn = (void *)lookup_name_optional_suffix("sidtab_context_to_sid");
     g_sidtab = (struct sidtab *)lookup_name_optional_suffix("sidtab");
     kmalloc_fn = (void *)lookup_name_optional_suffix("kmalloc");
+    __kmalloc_fn = (void *)lookup_name_optional_suffix("__kmalloc");
+    if (!kmalloc_fn)
+        kmalloc_fn = __kmalloc_fn;
     kfree_fn = (void *)lookup_name_optional_suffix("kfree");
 
     /* 4.4 contextExists() hardening: reject only known DirtySepolicy probe
@@ -6709,6 +6718,7 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("sidtab_context_to_sid", (void *)sidtab_context_to_sid_fn);
     log_symbol_addr("sidtab", (void *)g_sidtab);
     log_symbol_addr("kmalloc", (void *)kmalloc_fn);
+    log_symbol_addr("__kmalloc", (void *)__kmalloc_fn);
     log_symbol_addr("kfree", (void *)kfree_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
     log_symbol_addr("security_task_getsecid", (void *)security_task_getsecid_fn);
@@ -6757,8 +6767,8 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] CLEAN44 transform SID helpers unavailable security_sid_to_context=%px sidtab_context_to_sid=%px sidtab=%px\n",
                 security_sid_to_context_fn, sidtab_context_to_sid_fn, g_sidtab);
     if (!kmalloc_fn || !kfree_fn)
-        pr_warn("[selinux_hook] CLEAN44 transform allocator helpers unavailable kmalloc=%px kfree=%px\n",
-                kmalloc_fn, kfree_fn);
+        pr_warn("[selinux_hook] CLEAN44 transform allocator helpers unavailable kmalloc=%px __kmalloc=%px kfree=%px\n",
+                kmalloc_fn, __kmalloc_fn, kfree_fn);
 
     if (!policydb_read_fn || !policydb_destroy_fn)
         pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, legacy clean policydb disabled\n");
