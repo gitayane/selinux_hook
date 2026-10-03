@@ -5112,8 +5112,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         if (clean44_denied_context_type(sample)) {
             a->skip_origin = 1;
             a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d comm=%s query=\"%s\"\n",
-                    uid, current_comm(), sample);
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d sid=%u app_zygote=%d comm=%s query=\"%s\"\n",
+                    uid, current_selinux_sid_44(), caller_is_app_zygote, current_comm(), sample);
             return;
         }
 
@@ -5291,6 +5291,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     u32 slot;
     u32 n;
     uid_t uid;
+    bool caller_is_app_zygote = false;
 
     a->local.data0 = 0;
     a->local.data1 = 0;
@@ -5298,6 +5299,9 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
+
+    if (selinux_44_compat_path())
+        caller_is_app_zygote = current_is_app_zygote_44();
 
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
