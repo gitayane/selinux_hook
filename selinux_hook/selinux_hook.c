@@ -1782,9 +1782,13 @@ static bool write_op_slot_fallback_allowed(void)
 static bool security_setprocattr_has_lsm_arg(void)
 {
     /*
-     * security/security.c:
-     *   < 5.4  security_setprocattr(name, value, size)
-     *   >=5.4  security_setprocattr(lsm, name, value, size)
+     * This helper is only used for the post-4.9/non-legacy route.
+     *
+     * Linux 4.4/4.9 on this device use the older task-first form:
+     *   security_setprocattr(task, name, value, size)
+     *
+     * Newer kernels in the generic route use the LSM-first form:
+     *   security_setprocattr(lsm, name, value, size)
      */
     return kver >= VERSION(5, 4, 0);
 }
@@ -6899,12 +6903,24 @@ static long init(const char *args, const char *event, void *__user r)
         selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped on non-legacy path; clean snapshots use the existing staged/blob route\n");
     }
 
-    /* setprocattr ABI split / setprocattr ABI 分叉：4.9 是 task-first，其他内核走原签名探测。 */
+    /*
+     * setprocattr ABI split:
+     *
+     * Linux 4.4 and 4.9 use the task-first four-argument form
+     *   (task, name, value, size).
+     *
+     * Do NOT route 4.4 through the 3-argument "legacy" wrapper: the uploaded
+     * XZ Premium dmesg showed arg2 as a pointer-sized value
+     * (184467438...); that is the actual value pointer being interpreted as
+     * size_t. The 4-argument task-first wrapper already exists and matches
+     * the real 4.4 ABI.
+     */
     addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
     if (addr) {
-        if (selinux_49_compat_path()) {
+        if (selinux_44_compat_path() || selinux_49_compat_path()) {
             g_funcs[g_hooks++] = (void *)addr;
-            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task 4.9\n");
+            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task-first kver=%x\n",
+                             kver);
             hook_wrap((void *)addr, 4, before_security_setprocattr_task_49, NULL, NULL);
         } else {
             bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
@@ -6923,9 +6939,10 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
     if (addr) {
-        if (selinux_49_compat_path()) {
+        if (selinux_44_compat_path() || selinux_49_compat_path()) {
             g_funcs[g_hooks++] = (void *)addr;
-            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task 4.9\n");
+            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task-first kver=%x\n",
+                             kver);
             hook_wrap((void *)addr, 4, before_selinux_setprocattr_task_49, NULL, NULL);
         } else {
             g_funcs[g_hooks++] = (void *)addr;
