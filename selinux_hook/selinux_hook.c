@@ -611,6 +611,7 @@ static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
 static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
+static size_t str_len_safe(const char *s);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
 static bool dirtysepolicy_context_should_hide(const char *query);
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
