@@ -550,6 +550,7 @@ static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
 static u32 g_app_zygote_sid_44;
 static u32 g_sepolicy_zygote_sid_44;
+static bool g_sepolicy_sid_diag_done;
 static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
@@ -1137,6 +1138,20 @@ static bool current_sid_matches_context_44(u32 sid, const char *expected)
         return false;
 
     rc = security_sid_to_context_fn(sid, &actual, &actual_len);
+
+    /* One-shot runtime diagnostic for the real 4.4 sepolicy_zygote SID. */
+    if (!g_sepolicy_sid_diag_done &&
+        clean44_bytes_equal(current->comm, "sepolicy_zygote", sizeof("sepolicy_zygote") - 1)) {
+        g_sepolicy_sid_diag_done = true;
+        if (rc || !actual) {
+            pr_info("[selinux_hook] CLEAN44 sepolicy_zygote SID->context diag sid=%u rc=%d actual=%px len=%u\\n",
+                    sid, rc, actual, actual_len);
+        } else {
+            pr_info("[selinux_hook] CLEAN44 sepolicy_zygote SID->context diag sid=%u rc=%d len=%u context=%.*s expected=%s\\n",
+                    sid, rc, actual_len, (int)actual_len, actual, expected);
+        }
+    }
+
     if (rc || !actual)
         return false;
 
