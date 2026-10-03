@@ -1261,6 +1261,9 @@ static ssize_t hooked_sel_write_relabel(struct file *file, char *buf, size_t siz
 static ssize_t hooked_sel_write_user(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_member(struct file *file, char *buf, size_t size);
 
+static int hotpatch_write_op_slot(sel_write_op_fn *slot,
+                                   sel_write_op_fn value,
+                                   sel_write_op_fn *old_value);
 static void install_write_op_44_extras(sel_write_op_fn *write_op)
 {
     int rc;
@@ -1335,56 +1338,6 @@ static void install_write_op_44_extras(sel_write_op_fn *write_op)
     } else {
         pr_warn("[selinux_hook] write_op member slot is empty\n");
     }
-}
-
-static int install_write_op_hooks(void);
-static void uninstall_write_op_hooks(void)
-{
-    int rc;
-
-#define RESTORE_WRITE_OP(flag, slot, orig, name) \
-    do { \
-        if ((flag) && (slot) && (orig)) { \
-            rc = hotpatch_write_op_slot((slot), (orig), NULL); \
-            if (rc) \
-                pr_warn("[selinux_hook] restore write_op %s failed rc=%d\n", \
-                        (name), rc); \
-        } \
-    } while (0)
-
-    RESTORE_WRITE_OP(g_write_op_context_patched, g_write_op_context_slot,
-                     g_orig_write_op_context, "context");
-    RESTORE_WRITE_OP(g_write_op_access_patched, g_write_op_access_slot,
-                     g_orig_write_op_access, "access");
-    RESTORE_WRITE_OP(g_write_op_member_patched, g_write_op_member_slot,
-                     g_orig_write_op_member, "member");
-    RESTORE_WRITE_OP(g_write_op_user_patched, g_write_op_user_slot,
-                     g_orig_write_op_user, "user");
-    RESTORE_WRITE_OP(g_write_op_relabel_patched, g_write_op_relabel_slot,
-                     g_orig_write_op_relabel, "relabel");
-    RESTORE_WRITE_OP(g_write_op_create_patched, g_write_op_create_slot,
-                     g_orig_write_op_create, "create");
-
-#undef RESTORE_WRITE_OP
-
-    g_write_op_context_patched = false;
-    g_write_op_context_slot = NULL;
-    g_orig_write_op_context = NULL;
-    g_write_op_access_patched = false;
-    g_write_op_access_slot = NULL;
-    g_orig_write_op_access = NULL;
-    g_write_op_member_patched = false;
-    g_write_op_member_slot = NULL;
-    g_orig_write_op_member = NULL;
-    g_write_op_user_patched = false;
-    g_write_op_user_slot = NULL;
-    g_orig_write_op_user = NULL;
-    g_write_op_relabel_patched = false;
-    g_write_op_relabel_slot = NULL;
-    g_orig_write_op_relabel = NULL;
-    g_write_op_create_patched = false;
-    g_write_op_create_slot = NULL;
-    g_orig_write_op_create = NULL;
 }
 
 static void uninstall_inline_hooks(void);
@@ -4595,7 +4548,7 @@ static int clean44_mls_copy_low(struct context *dst,
     if (rc && ebitmap_destroy_fn)
         ebitmap_destroy_fn(&dst->range.level[0].cat);
     if (rc)
-        zero_bytes(&dst->range);
+        zero_bytes(&dst->range, sizeof(dst->range));
     return rc;
 }
 
@@ -4617,7 +4570,7 @@ static int clean44_mls_copy_high(struct context *dst,
     if (rc && ebitmap_destroy_fn)
         ebitmap_destroy_fn(&dst->range.level[0].cat);
     if (rc)
-        zero_bytes(&dst->range);
+        zero_bytes(&dst->range, sizeof(dst->range));
     return rc;
 }
 
@@ -4680,7 +4633,7 @@ fail:
         ebitmap_destroy_fn(&dst->range.level[0].cat);
         ebitmap_destroy_fn(&dst->range.level[1].cat);
     }
-    zero_bytes(&dst->range);
+    zero_bytes(&dst->range, sizeof(dst->range));
     return rc;
 }
 
@@ -5976,23 +5929,49 @@ static void uninstall_write_op_hooks(void)
 {
     int rc;
 
-    if (g_write_op_context_patched && g_write_op_context_slot && g_orig_write_op_context) {
-        rc = hotpatch_write_op_slot(g_write_op_context_slot, g_orig_write_op_context, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op context failed rc=%d\n", rc);
-    }
+#define RESTORE_WRITE_OP(flag, slot, orig, name) \
+    do { \
+        if ((flag) && (slot) && (orig)) { \
+            rc = hotpatch_write_op_slot((slot), (orig), NULL); \
+            if (rc) \
+                pr_warn("[selinux_hook] restore write_op %s failed rc=%d\n", \
+                        (name), rc); \
+        } \
+    } while (0)
+
+    RESTORE_WRITE_OP(g_write_op_context_patched, g_write_op_context_slot,
+                     g_orig_write_op_context, "context");
+    RESTORE_WRITE_OP(g_write_op_access_patched, g_write_op_access_slot,
+                     g_orig_write_op_access, "access");
+    RESTORE_WRITE_OP(g_write_op_member_patched, g_write_op_member_slot,
+                     g_orig_write_op_member, "member");
+    RESTORE_WRITE_OP(g_write_op_user_patched, g_write_op_user_slot,
+                     g_orig_write_op_user, "user");
+    RESTORE_WRITE_OP(g_write_op_relabel_patched, g_write_op_relabel_slot,
+                     g_orig_write_op_relabel, "relabel");
+    RESTORE_WRITE_OP(g_write_op_create_patched, g_write_op_create_slot,
+                     g_orig_write_op_create, "create");
+
+#undef RESTORE_WRITE_OP
+
     g_write_op_context_patched = false;
     g_write_op_context_slot = NULL;
     g_orig_write_op_context = NULL;
-
-    if (g_write_op_access_patched && g_write_op_access_slot && g_orig_write_op_access) {
-        rc = hotpatch_write_op_slot(g_write_op_access_slot, g_orig_write_op_access, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op access failed rc=%d\n", rc);
-    }
     g_write_op_access_patched = false;
     g_write_op_access_slot = NULL;
     g_orig_write_op_access = NULL;
+    g_write_op_member_patched = false;
+    g_write_op_member_slot = NULL;
+    g_orig_write_op_member = NULL;
+    g_write_op_user_patched = false;
+    g_write_op_user_slot = NULL;
+    g_orig_write_op_user = NULL;
+    g_write_op_relabel_patched = false;
+    g_write_op_relabel_slot = NULL;
+    g_orig_write_op_relabel = NULL;
+    g_write_op_create_patched = false;
+    g_write_op_create_slot = NULL;
+    g_orig_write_op_create = NULL;
 }
 
 static void uninstall_inline_hooks(void)
@@ -6773,12 +6752,10 @@ static long init(const char *args, const char *event, void *__user r)
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!security_sid_to_context_fn || !sidtab_context_to_sid_fn || !g_sidtab)
-        pr_warn("[selinux_hook] CLEAN44 transform SID helpers unavailable security_sid_to_context=%px sidtab_context_to_sid=%px sidtab=%px
-",
+        pr_warn("[selinux_hook] CLEAN44 transform SID helpers unavailable security_sid_to_context=%px sidtab_context_to_sid=%px sidtab=%px\n",
                 security_sid_to_context_fn, sidtab_context_to_sid_fn, g_sidtab);
     if (!kmalloc_fn || !kfree_fn)
-        pr_warn("[selinux_hook] CLEAN44 transform allocator helpers unavailable kmalloc=%px kfree=%px
-",
+        pr_warn("[selinux_hook] CLEAN44 transform allocator helpers unavailable kmalloc=%px kfree=%px\n",
                 kmalloc_fn, kfree_fn);
 
     if (!policydb_read_fn || !policydb_destroy_fn)
