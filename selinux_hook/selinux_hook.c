@@ -5112,8 +5112,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         if (clean44_denied_context_type(sample)) {
             a->skip_origin = 1;
             a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d sid=%u app_zygote=%d comm=%s query=\"%s\"\n",
-                    uid, current_selinux_sid_44(), caller_is_app_zygote, current_comm(), sample);
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d comm=%s query=\"%s\"\n",
+                    uid, current_comm(), sample);
             return;
         }
 
@@ -5317,8 +5317,8 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         if (clean44_denied_context_type(sample)) {
             a->skip_origin = 1;
             a->ret = (uint64_t)-EINVAL;
-            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d comm=%s query=\"%s\"\n",
-                    uid, current_comm(), sample);
+            pr_info("[selinux_hook] CLEAN44 policy-exception context-deny uid=%d sid=%u app_zygote=%d comm=%s query=\"%s\"\n",
+                    uid, current_selinux_sid_44(), caller_is_app_zygote, current_comm(), sample);
             return;
         }
 
