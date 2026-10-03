@@ -61,8 +61,43 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define MAGISK_MOCK_POLICY_MAX_SIZE (8 * 1024 * 1024)
 #define CLEAN_EVAL_SCOPE_SLOTS 8
 #define STATUS_READ_SCOPE_SLOTS 8
+#define SEL_WRITE_OP_CREATE 1
+#define SEL_WRITE_OP_RELABEL 2
+#define SEL_WRITE_OP_USER 3
+#define SEL_WRITE_OP_MEMBER 4
 #define SEL_WRITE_OP_CONTEXT 5
 #define SEL_WRITE_OP_ACCESS 6
+
+#ifndef AVTAB_TRANSITION
+#define AVTAB_TRANSITION 0x0010
+#endif
+#ifndef AVTAB_MEMBER
+#define AVTAB_MEMBER 0x0020
+#endif
+#ifndef AVTAB_CHANGE
+#define AVTAB_CHANGE 0x0040
+#endif
+#ifndef AVTAB_ENABLED
+#define AVTAB_ENABLED 0x8000
+#endif
+#ifndef DEFAULT_SOURCE
+#define DEFAULT_SOURCE 1
+#endif
+#ifndef DEFAULT_TARGET
+#define DEFAULT_TARGET 2
+#endif
+#ifndef DEFAULT_SOURCE_LOW
+#define DEFAULT_SOURCE_LOW 1
+#define DEFAULT_SOURCE_HIGH 2
+#define DEFAULT_SOURCE_LOW_HIGH 3
+#define DEFAULT_TARGET_LOW 4
+#define DEFAULT_TARGET_HIGH 5
+#define DEFAULT_TARGET_LOW_HIGH 6
+#define DEFAULT_GLBLUB 7
+#endif
+#ifndef OBJECT_R_VAL
+#define OBJECT_R_VAL 1
+#endif
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
@@ -80,10 +115,22 @@ static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
 extern unsigned long *pgtable_entry(unsigned long pgd, unsigned long va);
+static sel_write_op_fn *g_write_op_create_slot;
+static sel_write_op_fn *g_write_op_relabel_slot;
+static sel_write_op_fn *g_write_op_user_slot;
+static sel_write_op_fn *g_write_op_member_slot;
 static sel_write_op_fn *g_write_op_access_slot;
 static sel_write_op_fn *g_write_op_context_slot;
+static sel_write_op_fn g_orig_write_op_create;
+static sel_write_op_fn g_orig_write_op_relabel;
+static sel_write_op_fn g_orig_write_op_user;
+static sel_write_op_fn g_orig_write_op_member;
 static sel_write_op_fn g_orig_write_op_access;
 static sel_write_op_fn g_orig_write_op_context;
+static bool g_write_op_create_patched;
+static bool g_write_op_relabel_patched;
+static bool g_write_op_user_patched;
+static bool g_write_op_member_patched;
 static bool g_write_op_access_patched;
 static bool g_write_op_context_patched;
 static bool g_write_op_install_deferred;
@@ -461,6 +508,11 @@ static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, lof
 static loff_t (*vfs_llseek_fn)(struct file *file, loff_t offset, int whence);
 static void *g_selinux_state;
 static void (*security_task_getsecid_fn)(struct task_struct *task, u32 *secid);
+static int (*security_sid_to_context_fn)(u32 sid, char **scontext, u32 *scontext_len);
+static int (*sidtab_context_to_sid_fn)(struct sidtab *sidtab, struct context *context, u32 *sid);
+static struct sidtab *g_sidtab;
+static void *(*kmalloc_fn)(size_t size, gfp_t flags);
+static void (*kfree_fn)(const void *addr);
 
 static bool g_selinux_ready;
 static bool g_dirty_policy_seen;
@@ -1204,8 +1256,137 @@ static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
 static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
+static ssize_t hooked_sel_write_create(struct file *file, char *buf, size_t size);
+static ssize_t hooked_sel_write_relabel(struct file *file, char *buf, size_t size);
+static ssize_t hooked_sel_write_user(struct file *file, char *buf, size_t size);
+static ssize_t hooked_sel_write_member(struct file *file, char *buf, size_t size);
+
+static void install_write_op_44_extras(sel_write_op_fn *write_op)
+{
+    int rc;
+
+    if (!write_op || !selinux_44_compat_path())
+        return;
+
+    if (READ_ONCE(write_op[SEL_WRITE_OP_CREATE])) {
+        g_write_op_create_slot = &write_op[SEL_WRITE_OP_CREATE];
+        rc = hotpatch_write_op_slot(g_write_op_create_slot,
+                                    hooked_sel_write_create,
+                                    &g_orig_write_op_create);
+        if (!rc) {
+            g_write_op_create_patched = true;
+            pr_info("[selinux_hook] hook sel_write_create mode=write_op[%d] 4.4\n",
+                    SEL_WRITE_OP_CREATE);
+        } else {
+            g_write_op_create_slot = NULL;
+            pr_warn("[selinux_hook] patch write_op create failed rc=%d\n", rc);
+        }
+    } else {
+        pr_warn("[selinux_hook] write_op create slot is empty\n");
+    }
+
+    if (READ_ONCE(write_op[SEL_WRITE_OP_RELABEL])) {
+        g_write_op_relabel_slot = &write_op[SEL_WRITE_OP_RELABEL];
+        rc = hotpatch_write_op_slot(g_write_op_relabel_slot,
+                                    hooked_sel_write_relabel,
+                                    &g_orig_write_op_relabel);
+        if (!rc) {
+            g_write_op_relabel_patched = true;
+            pr_info("[selinux_hook] hook sel_write_relabel mode=write_op[%d] 4.4\n",
+                    SEL_WRITE_OP_RELABEL);
+        } else {
+            g_write_op_relabel_slot = NULL;
+            pr_warn("[selinux_hook] patch write_op relabel failed rc=%d\n", rc);
+        }
+    } else {
+        pr_warn("[selinux_hook] write_op relabel slot is empty\n");
+    }
+
+    if (READ_ONCE(write_op[SEL_WRITE_OP_USER])) {
+        g_write_op_user_slot = &write_op[SEL_WRITE_OP_USER];
+        rc = hotpatch_write_op_slot(g_write_op_user_slot,
+                                    hooked_sel_write_user,
+                                    &g_orig_write_op_user);
+        if (!rc) {
+            g_write_op_user_patched = true;
+            pr_info("[selinux_hook] hook sel_write_user mode=write_op[%d] 4.4\n",
+                    SEL_WRITE_OP_USER);
+        } else {
+            g_write_op_user_slot = NULL;
+            pr_warn("[selinux_hook] patch write_op user failed rc=%d\n", rc);
+        }
+    } else {
+        pr_warn("[selinux_hook] write_op user slot is empty\n");
+    }
+
+    if (READ_ONCE(write_op[SEL_WRITE_OP_MEMBER])) {
+        g_write_op_member_slot = &write_op[SEL_WRITE_OP_MEMBER];
+        rc = hotpatch_write_op_slot(g_write_op_member_slot,
+                                    hooked_sel_write_member,
+                                    &g_orig_write_op_member);
+        if (!rc) {
+            g_write_op_member_patched = true;
+            pr_info("[selinux_hook] hook sel_write_member mode=write_op[%d] 4.4\n",
+                    SEL_WRITE_OP_MEMBER);
+        } else {
+            g_write_op_member_slot = NULL;
+            pr_warn("[selinux_hook] patch write_op member failed rc=%d\n", rc);
+        }
+    } else {
+        pr_warn("[selinux_hook] write_op member slot is empty\n");
+    }
+}
+
 static int install_write_op_hooks(void);
-static void uninstall_write_op_hooks(void);
+static void uninstall_write_op_hooks(void)
+{
+    int rc;
+
+#define RESTORE_WRITE_OP(flag, slot, orig, name) \
+    do { \
+        if ((flag) && (slot) && (orig)) { \
+            rc = hotpatch_write_op_slot((slot), (orig), NULL); \
+            if (rc) \
+                pr_warn("[selinux_hook] restore write_op %s failed rc=%d\n", \
+                        (name), rc); \
+        } \
+    } while (0)
+
+    RESTORE_WRITE_OP(g_write_op_context_patched, g_write_op_context_slot,
+                     g_orig_write_op_context, "context");
+    RESTORE_WRITE_OP(g_write_op_access_patched, g_write_op_access_slot,
+                     g_orig_write_op_access, "access");
+    RESTORE_WRITE_OP(g_write_op_member_patched, g_write_op_member_slot,
+                     g_orig_write_op_member, "member");
+    RESTORE_WRITE_OP(g_write_op_user_patched, g_write_op_user_slot,
+                     g_orig_write_op_user, "user");
+    RESTORE_WRITE_OP(g_write_op_relabel_patched, g_write_op_relabel_slot,
+                     g_orig_write_op_relabel, "relabel");
+    RESTORE_WRITE_OP(g_write_op_create_patched, g_write_op_create_slot,
+                     g_orig_write_op_create, "create");
+
+#undef RESTORE_WRITE_OP
+
+    g_write_op_context_patched = false;
+    g_write_op_context_slot = NULL;
+    g_orig_write_op_context = NULL;
+    g_write_op_access_patched = false;
+    g_write_op_access_slot = NULL;
+    g_orig_write_op_access = NULL;
+    g_write_op_member_patched = false;
+    g_write_op_member_slot = NULL;
+    g_orig_write_op_member = NULL;
+    g_write_op_user_patched = false;
+    g_write_op_user_slot = NULL;
+    g_orig_write_op_user = NULL;
+    g_write_op_relabel_patched = false;
+    g_write_op_relabel_slot = NULL;
+    g_orig_write_op_relabel = NULL;
+    g_write_op_create_patched = false;
+    g_write_op_create_slot = NULL;
+    g_orig_write_op_create = NULL;
+}
+
 static void uninstall_inline_hooks(void);
 static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
@@ -1664,6 +1845,11 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("selinux_state"),
     SYMBOL_CACHE_ENTRY("security_load_policy"),
     SYMBOL_CACHE_ENTRY("security_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("security_sid_to_context"),
+    SYMBOL_CACHE_ENTRY("sidtab_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("sidtab"),
+    SYMBOL_CACHE_ENTRY("kmalloc"),
+    SYMBOL_CACHE_ENTRY("kfree"),
     SYMBOL_CACHE_ENTRY("policydb_read"),
     SYMBOL_CACHE_ENTRY("policydb_destroy"),
     SYMBOL_CACHE_ENTRY("flex_array_get"),
@@ -1922,7 +2108,6 @@ static void *lookup_name_optional_suffix(const char *base)
         return NULL;
 
     resolve_required_symbols_once();
-    log_symbol_addr("security_task_getsecid", (void *)security_task_getsecid_fn);
 
     entry = find_cached_symbol(base);
     if (entry)
@@ -4276,6 +4461,655 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
     snapshot_clean_policy("legacy_compute_av");
 }
 
+
+/*
+ * 4.4 clean transition/change/member evaluator.
+ *
+ * Do not hook context_struct_compute_av globally. The original selinuxfs
+ * transaction handler executes first, preserving its normal permission and
+ * parsing behavior. Only a successful result is shadowed for app_zygote.
+ */
+static int clean44_ebitmap_setbit(struct ebitmap *bitmap, unsigned long bit)
+{
+    struct ebitmap_node *node;
+    struct ebitmap_node **pp;
+    unsigned long span;
+    unsigned long start;
+    unsigned long rel;
+    unsigned int index;
+    unsigned int offset;
+
+    if (!bitmap || !kmalloc_fn)
+        return -EINVAL;
+
+    span = (unsigned long)SELINUX_EBITMAP_UNIT_BITS *
+           (unsigned long)SELINUX_EBITMAP_UNIT_NUMS;
+    if (!span)
+        return -EINVAL;
+
+    start = bit - (bit % span);
+    rel = bit - start;
+    index = (unsigned int)(rel / SELINUX_EBITMAP_UNIT_BITS);
+    offset = (unsigned int)(rel % SELINUX_EBITMAP_UNIT_BITS);
+    if (index >= SELINUX_EBITMAP_UNIT_NUMS)
+        return -EINVAL;
+
+    for (node = bitmap->node; node; node = node->next) {
+        if (node->startbit == (u32)start)
+            goto set_existing;
+        if (node->startbit > (u32)start)
+            break;
+    }
+
+    node = (struct ebitmap_node *)kmalloc_fn(sizeof(*node), (gfp_t)0xD0U);
+    if (!node)
+        return -ENOMEM;
+
+    zero_bytes(node, sizeof(*node));
+    node->startbit = (u32)start;
+
+    pp = &bitmap->node;
+    while (*pp && (*pp)->startbit < node->startbit)
+        pp = &(*pp)->next;
+    node->next = *pp;
+    *pp = node;
+
+set_existing:
+    node->maps[index] |= 1UL << offset;
+    if (bitmap->highbit < (u32)(bit + 1))
+        bitmap->highbit = (u32)(bit + 1);
+    return 0;
+}
+
+static int clean44_ebitmap_clone(struct ebitmap *dst,
+                                 const struct ebitmap *src)
+{
+    struct ebitmap_node *sn;
+    struct ebitmap_node *dn;
+    struct ebitmap_node **tail;
+
+    if (!dst || !src || !kmalloc_fn)
+        return -EINVAL;
+
+    zero_bytes(dst, sizeof(*dst));
+    dst->highbit = src->highbit;
+    tail = &dst->node;
+
+    for (sn = src->node; sn; sn = sn->next) {
+        dn = (struct ebitmap_node *)kmalloc_fn(sizeof(*dn), (gfp_t)0xD0U);
+        if (!dn) {
+            if (ebitmap_destroy_fn)
+                ebitmap_destroy_fn(dst);
+            zero_bytes(dst, sizeof(*dst));
+            return -ENOMEM;
+        }
+        copy_bytes(dn, sn, sizeof(*dn));
+        dn->next = NULL;
+        *tail = dn;
+        tail = &dn->next;
+    }
+    return 0;
+}
+
+static int clean44_mls_clone_range(struct mls_range *dst,
+                                   const struct mls_range *src)
+{
+    int rc;
+
+    if (!dst || !src)
+        return -EINVAL;
+
+    zero_bytes(dst, sizeof(*dst));
+    dst->level[0].sens = src->level[0].sens;
+    rc = clean44_ebitmap_clone(&dst->level[0].cat,
+                               &src->level[0].cat);
+    if (rc)
+        return rc;
+
+    dst->level[1].sens = src->level[1].sens;
+    rc = clean44_ebitmap_clone(&dst->level[1].cat,
+                               &src->level[1].cat);
+    if (rc) {
+        if (ebitmap_destroy_fn)
+            ebitmap_destroy_fn(&dst->level[0].cat);
+        zero_bytes(dst, sizeof(*dst));
+    }
+    return rc;
+}
+
+static int clean44_mls_copy_low(struct context *dst,
+                                const struct context *src)
+{
+    int rc;
+
+    zero_bytes(&dst->range, sizeof(dst->range));
+    dst->range.level[0].sens = src->range.level[0].sens;
+    rc = clean44_ebitmap_clone(&dst->range.level[0].cat,
+                               &src->range.level[0].cat);
+    if (rc)
+        return rc;
+
+    dst->range.level[1].sens = src->range.level[0].sens;
+    rc = clean44_ebitmap_clone(&dst->range.level[1].cat,
+                               &src->range.level[0].cat);
+    if (rc && ebitmap_destroy_fn)
+        ebitmap_destroy_fn(&dst->range.level[0].cat);
+    if (rc)
+        zero_bytes(&dst->range);
+    return rc;
+}
+
+static int clean44_mls_copy_high(struct context *dst,
+                                 const struct context *src)
+{
+    int rc;
+
+    zero_bytes(&dst->range, sizeof(dst->range));
+    dst->range.level[0].sens = src->range.level[1].sens;
+    rc = clean44_ebitmap_clone(&dst->range.level[0].cat,
+                               &src->range.level[1].cat);
+    if (rc)
+        return rc;
+
+    dst->range.level[1].sens = src->range.level[1].sens;
+    rc = clean44_ebitmap_clone(&dst->range.level[1].cat,
+                               &src->range.level[1].cat);
+    if (rc && ebitmap_destroy_fn)
+        ebitmap_destroy_fn(&dst->range.level[0].cat);
+    if (rc)
+        zero_bytes(&dst->range);
+    return rc;
+}
+
+static int clean44_mls_copy_full(struct context *dst,
+                                 const struct context *src)
+{
+    return clean44_mls_clone_range(&dst->range, &src->range);
+}
+
+static int clean44_mls_copy_glblub(struct context *dst,
+                                   const struct context *src,
+                                   const struct context *tgt)
+{
+    int rc;
+    unsigned int level;
+
+    zero_bytes(&dst->range, sizeof(dst->range));
+
+    for (level = 0; level < 2; level++) {
+        struct ebitmap_node *node;
+        unsigned int map_i;
+        unsigned int bit_i;
+
+        dst->range.level[level].sens =
+            src->range.level[level].sens >= tgt->range.level[level].sens
+            ? src->range.level[level].sens
+            : tgt->range.level[level].sens;
+
+        rc = clean44_ebitmap_clone(&dst->range.level[level].cat,
+                                   &src->range.level[level].cat);
+        if (rc)
+            goto fail;
+
+        for (node = tgt->range.level[level].cat.node; node; node = node->next) {
+            for (map_i = 0; map_i < SELINUX_EBITMAP_UNIT_NUMS; map_i++) {
+                unsigned long map = node->maps[map_i];
+
+                for (bit_i = 0; bit_i < SELINUX_EBITMAP_UNIT_BITS; bit_i++) {
+                    unsigned long bit;
+
+                    if (!(map & (1UL << bit_i)))
+                        continue;
+
+                    bit = (unsigned long)node->startbit +
+                          (unsigned long)map_i * SELINUX_EBITMAP_UNIT_BITS +
+                          bit_i;
+
+                    rc = clean44_ebitmap_setbit(
+                        &dst->range.level[level].cat, bit);
+                    if (rc)
+                        goto fail;
+                }
+            }
+        }
+    }
+    return 0;
+
+fail:
+    if (ebitmap_destroy_fn) {
+        ebitmap_destroy_fn(&dst->range.level[0].cat);
+        ebitmap_destroy_fn(&dst->range.level[1].cat);
+    }
+    zero_bytes(&dst->range);
+    return rc;
+}
+
+static int clean44_mls_for_sid(struct policydb *p,
+                               struct context *sctx,
+                               struct context *tctx,
+                               u16 tclass,
+                               u32 specified,
+                               struct context *newctx)
+{
+    struct range_trans rtr;
+    struct mls_range *range = NULL;
+    struct class_datum *cd = NULL;
+    int default_range = 0;
+
+    if (!p || !sctx || !tctx || !newctx)
+        return -EINVAL;
+
+    if (!p->mls_enabled)
+        return 0;
+
+    if (specified == AVTAB_TRANSITION) {
+        rtr.source_type = sctx->type;
+        rtr.target_type = tctx->type;
+        rtr.target_class = tclass;
+
+        if (p->range_tr && hashtab_search_fn)
+            range = (struct mls_range *)hashtab_search_fn(
+                p->range_tr, &rtr);
+
+        if (range)
+            return clean44_mls_clone_range(&newctx->range, range);
+
+        if (tclass && tclass <= p->symtab[SYM_CLASSES].nprim &&
+            p->class_val_to_struct)
+            cd = p->class_val_to_struct[tclass - 1];
+
+        if (cd)
+            default_range = cd->default_range;
+
+        switch (default_range) {
+        case DEFAULT_SOURCE_LOW:
+            return clean44_mls_copy_low(newctx, sctx);
+        case DEFAULT_SOURCE_HIGH:
+            return clean44_mls_copy_high(newctx, sctx);
+        case DEFAULT_SOURCE_LOW_HIGH:
+            return clean44_mls_copy_full(newctx, sctx);
+        case DEFAULT_TARGET_LOW:
+            return clean44_mls_copy_low(newctx, tctx);
+        case DEFAULT_TARGET_HIGH:
+            return clean44_mls_copy_high(newctx, tctx);
+        case DEFAULT_TARGET_LOW_HIGH:
+            return clean44_mls_copy_full(newctx, tctx);
+        case DEFAULT_GLBLUB:
+            return clean44_mls_copy_glblub(newctx, sctx, tctx);
+        default:
+            break;
+        }
+    }
+
+    if (specified == AVTAB_CHANGE) {
+        if (tclass == p->process_class)
+            return clean44_mls_copy_full(newctx, sctx);
+        return clean44_mls_copy_low(newctx, sctx);
+    }
+
+    if (specified == AVTAB_MEMBER)
+        return clean44_mls_copy_low(newctx, sctx);
+
+    return -EINVAL;
+}
+
+static struct avtab_node *clean44_find_type_rule(struct policydb *p,
+                                                 u32 source_type,
+                                                 u32 target_type,
+                                                 u16 tclass,
+                                                 u16 specified)
+{
+    struct avtab_key key;
+    struct avtab_node *node;
+
+    if (!p || !avtab_search_node_fn)
+        return NULL;
+
+    zero_bytes(&key, sizeof(key));
+    key.source_type = source_type;
+    key.target_type = target_type;
+    key.target_class = tclass;
+    key.specified = specified;
+
+    node = avtab_search_node_fn(&p->te_avtab, &key);
+    if (node)
+        return node;
+
+    node = avtab_search_node_fn(&p->te_cond_avtab, &key);
+    while (node) {
+        if (node->key.specified & AVTAB_ENABLED)
+            return node;
+        if (!avtab_search_node_next_fn)
+            break;
+        node = avtab_search_node_next_fn(node, specified);
+    }
+    return NULL;
+}
+
+static void clean44_context_destroy(struct context *ctx)
+{
+    if (!ctx)
+        return;
+
+    if (ebitmap_destroy_fn) {
+        ebitmap_destroy_fn(&ctx->range.level[0].cat);
+        ebitmap_destroy_fn(&ctx->range.level[1].cat);
+    }
+    zero_bytes(ctx, sizeof(*ctx));
+}
+
+static int clean44_compute_sid(const char *scon,
+                               const char *tcon,
+                               u16 tclass,
+                               u32 specified,
+                               const char *objname,
+                               u32 *out_sid)
+{
+    struct policydb *p;
+    struct context sctx;
+    struct context tctx;
+    struct context newctx;
+    struct avtab_node *node;
+    struct class_datum *cd = NULL;
+    struct role_trans *rt;
+    int rc;
+
+    /* Filename transitions need the exact 4.4 filename_compute_type() ABI;
+     * leave them untouched until the detector actually exercises one. */
+    (void)objname;
+
+    if (!out_sid || !scon || !tcon)
+        return -EINVAL;
+
+    p = (struct policydb *)READ_ONCE(g_clean_policydb);
+    if (!p)
+        return -EAGAIN;
+
+    zero_bytes(&sctx, sizeof(sctx));
+    zero_bytes(&tctx, sizeof(tctx));
+    zero_bytes(&newctx, sizeof(newctx));
+
+    rc = clean_context_to_struct(scon, str_len_safe(scon), &sctx);
+    if (rc)
+        return rc;
+
+    rc = clean_context_to_struct(tcon, str_len_safe(tcon), &tctx);
+    if (rc)
+        goto out_sctx;
+
+    if (!sctx.user || !sctx.role || !sctx.type ||
+        !tctx.user || !tctx.role || !tctx.type ||
+        sctx.type > p->symtab[SYM_TYPES].nprim ||
+        tctx.type > p->symtab[SYM_TYPES].nprim) {
+        rc = -EINVAL;
+        goto out_both;
+    }
+
+    if (tclass && tclass <= p->symtab[SYM_CLASSES].nprim &&
+        p->class_val_to_struct)
+        cd = p->class_val_to_struct[tclass - 1];
+
+    if (specified == AVTAB_MEMBER)
+        newctx.user = tctx.user;
+    else
+        newctx.user = (cd && cd->default_user == DEFAULT_TARGET)
+                     ? tctx.user : sctx.user;
+
+    if (cd && cd->default_role == DEFAULT_SOURCE)
+        newctx.role = sctx.role;
+    else if (cd && cd->default_role == DEFAULT_TARGET)
+        newctx.role = tctx.role;
+    else if (tclass == p->process_class)
+        newctx.role = sctx.role;
+    else
+        newctx.role = OBJECT_R_VAL;
+
+    if (cd && cd->default_type == DEFAULT_SOURCE)
+        newctx.type = sctx.type;
+    else if (cd && cd->default_type == DEFAULT_TARGET)
+        newctx.type = tctx.type;
+    else if (tclass == p->process_class)
+        newctx.type = sctx.type;
+    else
+        newctx.type = tctx.type;
+
+    node = clean44_find_type_rule(p, sctx.type, tctx.type, tclass,
+                                  (u16)specified);
+    if (node)
+        newctx.type = node->datum.u.data;
+
+    if (specified == AVTAB_TRANSITION) {
+        for (rt = p->role_tr; rt; rt = rt->next) {
+            if (rt->role == sctx.role &&
+                rt->type == tctx.type &&
+                rt->tclass == tclass) {
+                newctx.role = rt->new_role;
+                break;
+            }
+        }
+    }
+
+    rc = clean44_mls_for_sid(p, &sctx, &tctx, tclass,
+                             specified, &newctx);
+    if (rc)
+        goto out_both;
+
+    if (!policydb_context_isvalid_fn ||
+        !policydb_context_isvalid_fn(p, &newctx)) {
+        rc = -EINVAL;
+        goto out_both;
+    }
+
+    if (!g_sidtab || !sidtab_context_to_sid_fn) {
+        rc = -EAGAIN;
+        goto out_both;
+    }
+
+    rc = sidtab_context_to_sid_fn(g_sidtab, &newctx, out_sid);
+
+out_both:
+    clean44_context_destroy(&newctx);
+    clean44_context_destroy(&tctx);
+out_sctx:
+    clean44_context_destroy(&sctx);
+    return rc;
+}
+
+static int clean44_parse_class_query(const char *query,
+                                     char *scon, size_t scon_size,
+                                     char *tcon, size_t tcon_size,
+                                     u16 *tclass, char *objname,
+                                     size_t objname_size)
+{
+    int nargs;
+
+    if (!query || !scon || !tcon || !tclass)
+        return -EINVAL;
+
+    if (objname)
+        zero_bytes(objname, objname_size);
+
+    nargs = sscanf(query, "%255s %255s %hu %255s",
+                   scon, tcon, tclass,
+                   objname ? objname : scon);
+    if (nargs < 3)
+        return -EINVAL;
+
+    if (str_len_safe(scon) >= scon_size || str_len_safe(tcon) >= tcon_size)
+        return -EINVAL;
+
+    if (objname && nargs == 4) {
+        size_t i = 0;
+        size_t w = 0;
+
+        while (objname[i] && w + 1 < objname_size) {
+            char ch = objname[i++];
+
+            if (ch == '+') {
+                objname[w++] = ' ';
+            } else if (ch == '%' && objname[i] && objname[i + 1]) {
+                int h1 = (objname[i] >= '0' && objname[i] <= '9')
+                       ? objname[i] - '0'
+                       : (objname[i] >= 'a' && objname[i] <= 'f')
+                       ? objname[i] - 'a' + 10
+                       : (objname[i] >= 'A' && objname[i] <= 'F')
+                       ? objname[i] - 'A' + 10 : -1;
+                int h2 = (objname[i + 1] >= '0' && objname[i + 1] <= '9')
+                       ? objname[i + 1] - '0'
+                       : (objname[i + 1] >= 'a' && objname[i + 1] <= 'f')
+                       ? objname[i + 1] - 'a' + 10
+                       : (objname[i + 1] >= 'A' && objname[i + 1] <= 'F')
+                       ? objname[i + 1] - 'A' + 10 : -1;
+                if (h1 < 0 || h2 < 0)
+                    return -EINVAL;
+                objname[w++] = (char)((h1 << 4) | h2);
+                i += 2;
+            } else {
+                objname[w++] = ch;
+            }
+        }
+        objname[w] = '\0';
+    }
+
+    return 0;
+}
+
+static void before_sel_write_transform(hook_fargs4_t *a, void *u)
+{
+    a->local.data0 = (uint64_t)(uintptr_t)u;
+}
+
+static void before_sel_write_user44(hook_fargs4_t *a, void *u)
+{
+    (void)u;
+    a->local.data0 = 4;
+}
+
+static void after_sel_write_transform(hook_fargs4_t *a, void *u)
+{
+    u32 op = (u32)a->local.data0;
+    long live_ret = (long)a->ret;
+    char query[ACCESS_SAMPLE_MAX];
+    char scon[ACCESS_SAMPLE_MAX];
+    char tcon[ACCESS_SAMPLE_MAX];
+    char objname[ACCESS_SAMPLE_MAX];
+    char *newcon = NULL;
+    u32 newcon_len = 0;
+    u32 sid = 0;
+    u16 tclass = 0;
+    u32 specified;
+    int rc;
+    size_t i;
+
+    (void)u;
+
+    if (!selinux_44_compat_path() || op < 1 || op > 3)
+        return;
+
+    query[0] = '\0';
+    copy_query_sample(query, (const char *)a->arg1, (size_t)a->arg2);
+
+    for (i = 0; query[i] && query[i] != ' ' &&
+                query[i] != '\t' && i + 1 < sizeof(scon); i++)
+        scon[i] = query[i];
+    scon[i] = '\0';
+
+    if (clean44_denied_context_type(scon)) {
+        a->skip_origin = 1;
+        a->ret = (uint64_t)-EINVAL;
+        pr_info("[selinux_hook] CLEAN44 transform payload-deny uid=%d comm=%s op=%u query=\"%s\"\n",
+                current_uid(), current_comm(), op, query);
+        return;
+    }
+
+    if (live_ret <= 0 || !current_is_app_zygote_44())
+        return;
+
+    zero_bytes(scon, sizeof(scon));
+    zero_bytes(tcon, sizeof(tcon));
+    zero_bytes(objname, sizeof(objname));
+
+    rc = clean44_parse_class_query(query, scon, sizeof(scon),
+                                   tcon, sizeof(tcon), &tclass,
+                                   objname, sizeof(objname));
+    if (rc) {
+        pr_info("[selinux_hook] CLEAN44 transform-query-invalid uid=%d comm=%s op=%u query=\"%s\"\n",
+                current_uid(), current_comm(), op, query);
+        return;
+    }
+
+    if (clean44_denied_context_type(tcon)) {
+        a->skip_origin = 1;
+        a->ret = (uint64_t)-EINVAL;
+        pr_info("[selinux_hook] CLEAN44 transform payload-deny-target uid=%d comm=%s op=%u query=\"%s\"\n",
+                current_uid(), current_comm(), op, query);
+        return;
+    }
+
+    specified = op == 1 ? AVTAB_TRANSITION :
+                op == 2 ? AVTAB_CHANGE : AVTAB_MEMBER;
+
+    rc = clean44_compute_sid(scon, tcon, tclass, specified,
+                             (op == 1 && objname[0]) ? objname : NULL,
+                             &sid);
+    if (rc) {
+        if (rc != -EAGAIN)
+            pr_info("[selinux_hook] CLEAN44 transform-eval-failed uid=%d comm=%s op=%u rc=%d query=\"%s\"\n",
+                    current_uid(), current_comm(), op, rc, query);
+        return;
+    }
+
+    if (!security_sid_to_context_fn || !kfree_fn)
+        return;
+
+    rc = security_sid_to_context_fn(sid, &newcon, &newcon_len);
+    if (rc || !newcon || !newcon_len)
+        goto out_free;
+
+    if (newcon_len > SIMPLE_TRANSACTION_LIMIT)
+        goto out_free;
+
+    copy_bytes((char *)a->arg1, newcon, newcon_len);
+    a->skip_origin = 1;
+    a->ret = (uint64_t)newcon_len;
+
+    pr_info("[selinux_hook] CLEAN44 %s-shadow uid=%d comm=%s sid=%u len=%u query=\"%s\" result=\"%s\"\n",
+            op == 1 ? "create" : op == 2 ? "relabel" : "member",
+            current_uid(), current_comm(), sid, newcon_len, query, newcon);
+
+out_free:
+    if (newcon && kfree_fn)
+        kfree_fn(newcon);
+}
+
+static void after_sel_write_user44(hook_fargs4_t *a, void *u)
+{
+    char query[ACCESS_SAMPLE_MAX];
+    char con[ACCESS_SAMPLE_MAX];
+    size_t i;
+
+    (void)u;
+
+    if (!selinux_44_compat_path())
+        return;
+
+    query[0] = '\0';
+    con[0] = '\0';
+    copy_query_sample(query, (const char *)a->arg1, (size_t)a->arg2);
+
+    for (i = 0; query[i] && query[i] != ' ' &&
+                query[i] != '\t' && i + 1 < sizeof(con); i++)
+        con[i] = query[i];
+    con[i] = '\0';
+
+    if (clean44_denied_context_type(con)) {
+        a->skip_origin = 1;
+        a->ret = (uint64_t)-EINVAL;
+        pr_info("[selinux_hook] CLEAN44 user payload-deny uid=%d comm=%s query=\"%s\"\n",
+                current_uid(), current_comm(), query);
+    }
+}
+
 /* Hook: /sys/fs/selinux/access write handler */
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
@@ -4898,6 +5732,76 @@ static ssize_t run_sel_write_op_filter(const char *node, sel_write_op_fn origin,
     return (ssize_t)a.ret;
 }
 
+
+static ssize_t run_sel_write_op_filter_custom(sel_write_op_fn origin,
+                                              void (*before)(hook_fargs4_t *a, void *u),
+                                              void (*after)(hook_fargs4_t *a, void *u),
+                                              void *u,
+                                              struct file *file,
+                                              char *buf,
+                                              size_t size)
+{
+    hook_fargs4_t a;
+
+    zero_bytes(&a, sizeof(a));
+    a.arg0 = (uint64_t)file;
+    a.arg1 = (uint64_t)buf;
+    a.arg2 = (uint64_t)size;
+
+    if (before)
+        before(&a, u);
+
+    if (!a.skip_origin) {
+        if (!origin)
+            a.ret = (uint64_t)-EINVAL;
+        else
+            a.ret = (uint64_t)origin((struct file *)a.arg0,
+                                      (char *)a.arg1,
+                                      (size_t)a.arg2);
+    }
+
+    if (after)
+        after(&a, u);
+
+    return (ssize_t)a.ret;
+}
+
+static ssize_t hooked_sel_write_create(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter_custom(g_orig_write_op_create,
+                                          before_sel_write_transform,
+                                          after_sel_write_transform,
+                                          (void *)(uintptr_t)1,
+                                          file, buf, size);
+}
+
+static ssize_t hooked_sel_write_relabel(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter_custom(g_orig_write_op_relabel,
+                                          before_sel_write_transform,
+                                          after_sel_write_transform,
+                                          (void *)(uintptr_t)2,
+                                          file, buf, size);
+}
+
+static ssize_t hooked_sel_write_user(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter_custom(g_orig_write_op_user,
+                                          before_sel_write_user44,
+                                          after_sel_write_user44,
+                                          NULL,
+                                          file, buf, size);
+}
+
+static ssize_t hooked_sel_write_member(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter_custom(g_orig_write_op_member,
+                                          before_sel_write_transform,
+                                          after_sel_write_transform,
+                                          (void *)(uintptr_t)3,
+                                          file, buf, size);
+}
+
 static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size)
 {
     return run_sel_write_op_filter("access", g_orig_write_op_access,
@@ -4984,6 +5888,12 @@ static int install_write_op_hooks(void)
         } else {
             pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
         }
+
+        if (selinux_44_compat_path()) {
+            write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
+            log_symbol_addr("write_op(4.4 extras)", (void *)write_op);
+            install_write_op_44_extras(write_op);
+        }
         return 0;
     }
 
@@ -5023,6 +5933,9 @@ static int install_write_op_hooks(void)
         pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
         return -ENOENT;
     }
+
+    if (selinux_44_compat_path())
+        install_write_op_44_extras(write_op);
 
     g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
     g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
@@ -5751,6 +6664,11 @@ static long init(const char *args, const char *event, void *__user r)
     }
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
+    security_sid_to_context_fn = (void *)lookup_name_optional_suffix("security_sid_to_context");
+    sidtab_context_to_sid_fn = (void *)lookup_name_optional_suffix("sidtab_context_to_sid");
+    g_sidtab = (struct sidtab *)lookup_name_optional_suffix("sidtab");
+    kmalloc_fn = (void *)lookup_name_optional_suffix("kmalloc");
+    kfree_fn = (void *)lookup_name_optional_suffix("kfree");
 
     /* 4.4 contextExists() hardening: reject only known DirtySepolicy probe
      * contexts at the context->SID boundary.  Root/policy-manager callers
@@ -5806,6 +6724,11 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("selinux_state", g_selinux_state);
     log_symbol_addr("security_read_policy", (void *)security_read_policy_fn);
     log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
+    log_symbol_addr("security_sid_to_context", (void *)security_sid_to_context_fn);
+    log_symbol_addr("sidtab_context_to_sid", (void *)sidtab_context_to_sid_fn);
+    log_symbol_addr("sidtab", (void *)g_sidtab);
+    log_symbol_addr("kmalloc", (void *)kmalloc_fn);
+    log_symbol_addr("kfree", (void *)kfree_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
     log_symbol_addr("security_task_getsecid", (void *)security_task_getsecid_fn);
     log_symbol_addr("policydb_read", (void *)policydb_read_fn);
@@ -5849,6 +6772,15 @@ static long init(const char *args, const char *event, void *__user r)
     }
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
+    if (!security_sid_to_context_fn || !sidtab_context_to_sid_fn || !g_sidtab)
+        pr_warn("[selinux_hook] CLEAN44 transform SID helpers unavailable security_sid_to_context=%px sidtab_context_to_sid=%px sidtab=%px
+",
+                security_sid_to_context_fn, sidtab_context_to_sid_fn, g_sidtab);
+    if (!kmalloc_fn || !kfree_fn)
+        pr_warn("[selinux_hook] CLEAN44 transform allocator helpers unavailable kmalloc=%px kfree=%px
+",
+                kmalloc_fn, kfree_fn);
+
     if (!policydb_read_fn || !policydb_destroy_fn)
         pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, legacy clean policydb disabled\n");
     if (!flex_array_get_fn || !flex_array_get_ptr_fn || !avtab_search_node_fn || !avtab_search_node_next_fn)
