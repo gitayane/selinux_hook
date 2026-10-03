@@ -1260,6 +1260,8 @@ static ssize_t hooked_sel_write_create(struct file *file, char *buf, size_t size
 static ssize_t hooked_sel_write_relabel(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_user(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_member(struct file *file, char *buf, size_t size);
+static int install_write_op_hooks(void);
+static void uninstall_write_op_hooks(void);
 
 static int hotpatch_write_op_slot(sel_write_op_fn *slot,
                                    sel_write_op_fn value,
