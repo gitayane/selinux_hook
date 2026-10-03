@@ -1139,9 +1139,8 @@ static bool current_sid_matches_context_44(u32 sid, const char *expected)
 
     rc = security_sid_to_context_fn(sid, &actual, &actual_len);
 
-    /* One-shot runtime diagnostic for the real 4.4 sepolicy_zygote SID. */
-    if (!g_sepolicy_sid_diag_done &&
-        clean44_bytes_equal(current->comm, "sepolicy_zygote", sizeof("sepolicy_zygote") - 1)) {
+    /* One-shot runtime diagnostic for the SID observed on Maple 4.4.302. */
+    if (!g_sepolicy_sid_diag_done && sid == 1879) {
         g_sepolicy_sid_diag_done = true;
         if (rc || !actual) {
             pr_info("[selinux_hook] CLEAN44 sepolicy_zygote SID->context diag sid=%u rc=%d actual=%px len=%u\\n",
